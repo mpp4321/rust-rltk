@@ -1,12 +1,16 @@
 extern crate rltk;
 
 mod entities;
+mod structs;
 
 use entities::entity_create;
+use structs::*;
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::cmp::max;
+use serde::{Deserialize, Serialize};
+
+use std::cell::{Cell, RefCell};
 use std::fs::File;
+use std::io::{stdin, stdout, Read, Write};
 use std::rc::Rc;
 
 use rltk::{
@@ -14,7 +18,7 @@ use rltk::{
     VirtualKeyCode, XpFile, RGB,
 };
 
-type EntityIndex = usize;
+pub type EntityIndex = usize;
 
 mod math_utils {
     use rand::Rng;
@@ -41,244 +45,140 @@ mod math_utils {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
-enum TileType {
-    Wall,
-    Floor,
-    Object(Display),
+pub struct MapEditorState {
+    width: i32,
+    height: i32,
+
+    map_tiles: Vec<TileType>,
+    picked_tile: Display,
 }
 
-#[derive(Copy, Clone, PartialEq)]
-pub struct Display {
-    glyph: u16,
-    fg: RGB,
-    bg: RGB,
-}
-
-pub trait EntityAI {
-    fn get_id(&self) -> EntityIndex;
-
-    fn on_turn(&mut self, me: EntityIndex, state: &State);
-    fn on_remove(&mut self, me: EntityIndex, state: &State);
-    fn on_death(&mut self, me: EntityIndex, state: &State);
-}
-
-//Just things that every entity has and needs for rendering
-pub trait Entity {
-    fn get_id(&self) -> EntityIndex;
-
-    fn get_x(&self) -> i32;
-    fn get_y(&self) -> i32;
-    fn get_display(&self) -> Display;
-
-    fn set_x(&mut self, x: i32);
-    fn set_y(&mut self, y: i32);
-
-    fn set_display(&mut self, display: Display);
-
-    fn move_by(&mut self, _dx: i32, _dy: i32);
-}
-
-struct SelfDestructAI {
-    turns_left: i32,
-}
-impl EntityAI for SelfDestructAI {
-    fn get_id(&self) -> EntityIndex {
-        return 0;
-    }
-
-    fn on_turn(&mut self, me: EntityIndex, state: &State) {
-        self.turns_left -= 1;
-        if self.turns_left < 0 {
-            state.queue_destruction(me);
+impl MapEditorState {
+    fn new(width: i32, height: i32) -> Self {
+        MapEditorState {
+            width,
+            height,
+            map_tiles: vec![
+                TileType::Floor(Display {
+                    glyph: '.' as u16,
+                    fg: rltk::WHITE,
+                    bg: rltk::BLACK
+                });
+                (width * height) as usize
+            ],
+            picked_tile: Display {
+                glyph: '.' as u16,
+                fg: rltk::WHITE,
+                bg: rltk::BLACK,
+            },
         }
     }
 
-    fn on_remove(&mut self, _me: EntityIndex, _state: &State) {}
-
-    fn on_death(&mut self, _me: EntityIndex, _state: &State) {}
-}
-
-struct BasicEntity {
-    id: EntityIndex,
-
-    x: i32,
-    y: i32,
-    d: Display,
-}
-
-//Entities with stat blocks and complex interactions etc
-#[derive(Copy, Clone, Debug)]
-pub struct StatBlock {
-    id: EntityIndex,
-
-    def: i32,
-    atk: i32,
-    hp: i32,
-
-    dead: bool,
-}
-
-impl Default for StatBlock {
-    fn default() -> Self {
-        StatBlock {
-            id: 0,
-            atk: 0,
-            def: 0,
-            hp: 0,
-            dead: false,
-        }
-    }
-}
-
-impl StatBlock {
-    fn make_text_builder(&self, builder: &mut TextBuilder) {
-        builder
-            .append(format!("HP: {}", self.hp).as_str())
-            .ln()
-            .append(format!("ATK: {}", self.atk).as_str())
-            .ln()
-            .append(format!("DEF: {}", self.def).as_str());
+    fn xy_idx(&self, x: i32, y: i32) -> usize {
+        (y as usize * self.width as usize) + x as usize
     }
 
-    fn take_damage(&mut self, state: &State, damage: i32) -> bool {
-        self.hp -= damage;
-        if self.hp <= 0 {
-            self.hp = 0;
-            self.dead = true;
-            state.ais.borrow_mut()[self.id] = Some(Box::new(SelfDestructAI { turns_left: 5 }));
-            state.get_entity(self.id).borrow_mut().set_display(Display {
-                glyph: rltk::to_cp437('%'),
-                fg: RGB::named(rltk::RED),
-                bg: RGB::named(rltk::BLACK),
-            });
-
-            return true;
-        }
-
-        return false;
-    }
-}
-
-struct ZombieAI {
-    id: EntityIndex,
-}
-
-pub trait MyOptionTimeSaver<T> {
-    fn unwrap_ref(&self) -> Ref<T>;
-    fn unwrap_ref_mut(&self) -> RefMut<T>;
-}
-
-impl<T> MyOptionTimeSaver<T> for Option<RefCell<T>> {
-    fn unwrap_ref(&self) -> Ref<T> {
-        self.as_ref().unwrap().borrow()
+    fn in_bounds(&self, pos: (i32, i32)) -> bool {
+        pos.0 >= 0 && pos.0 < self.width && pos.1 >= 0 && pos.1 < self.height
     }
 
-    fn unwrap_ref_mut(&self) -> RefMut<T> {
-        self.as_ref().unwrap().borrow_mut()
-    }
-}
-
-impl EntityAI for ZombieAI {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
-
-    fn on_turn(&mut self, me: EntityIndex, state: &State) {
-        if math_utils::chance(0.5) {
+    fn handle_l_click(&mut self, pos: (i32, i32)) {
+        if !self.in_bounds(pos) {
             return;
         }
+        let indx = self.xy_idx(pos.0, pos.1);
+        self.map_tiles[indx] = TileType::Floor(self.picked_tile);
+    }
 
-        let player_pos = (
-            state.get_entity(0).borrow().get_x(),
-            state.get_entity(0).borrow().get_y(),
-        );
-        let mut me = state.get_entity(me).borrow_mut();
-        let zombie_pos = (me.get_x(), me.get_y());
-        //Calculate the direction to the player from zombie_pos
-        let dx = player_pos.0 - zombie_pos.0;
-        let dy = player_pos.1 - zombie_pos.1;
-        //Calculate the distance as float
-        let distance = (((dx * dx) + (dy * dy)) as f32).sqrt();
-        if distance > 3.0 {
+    fn handle_r_click(&mut self, pos: (i32, i32)) {
+        if !self.in_bounds(pos) {
             return;
         }
-        //Normalize dx, dy
+        let indx = self.xy_idx(pos.0, pos.1);
+        self.map_tiles[indx] = TileType::Wall(self.picked_tile);
+    }
 
-        let dx = dx / max(1, dx.abs());
-        let dy = dy / max(1, dy.abs());
+    fn export_to_file(&self) {
+        let mut file = File::create("output.map").unwrap();
+        let s_str = serde_json::to_string(&self.map_tiles).unwrap();
+        file.write(s_str.as_bytes()).unwrap();
+    }
 
-        const SQRT_2DIST: f32 = 0.01 + std::f64::consts::SQRT_2 as f32;
-        if distance < SQRT_2DIST {
-            state.stat_blocks[0].unwrap_ref_mut().take_damage(state, 1);
-        } else if state.can_move(me.get_x() + dx, me.get_y() + dy) {
-            me.move_by(dx, dy);
+    fn load_from_file(&mut self) {
+        let mut file = File::open("output.map").unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        let map_tiles: Vec<TileType> = serde_json::from_str(&contents).unwrap();
+        self.map_tiles = map_tiles;
+    }
+
+    fn draw_map(&self, ctx: &mut Rltk) {
+        for i in 0..self.width {
+            for j in 0..self.height {
+                let idx = self.xy_idx(i, j);
+                match self.map_tiles[idx] {
+                    TileType::Floor(ref t) => {
+                        ctx.set(i, j, t.fg, t.bg, t.glyph);
+                    }
+                    TileType::Wall(ref t) => {
+                        ctx.set(i, j, t.fg, t.bg, t.glyph);
+                    }
+                }
+            }
         }
     }
-    fn on_remove(&mut self, _: EntityIndex, _: &State) {}
-    fn on_death(&mut self, _: EntityIndex, _: &State) {}
+
 }
 
-impl Entity for BasicEntity {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+impl GameState for MapEditorState {
+    fn tick(&mut self, ctx: &mut Rltk) {
+        ctx.cls();
 
-    fn get_x(&self) -> i32 {
-        self.x
-    }
+        self.draw_map(ctx);
 
-    fn get_y(&self) -> i32 {
-        self.y
-    }
+        let mouse_pos = ctx.mouse_pos();
 
-    fn get_display(&self) -> Display {
-        self.d
-    }
+        let a = &rltk::INPUT;
+        let right_click = a.lock().is_mouse_button_pressed(1);
+        if ctx.left_click {
+            self.handle_l_click(mouse_pos);
+        } else if right_click {
+            self.handle_r_click(mouse_pos);
+        }
 
-    fn set_x(&mut self, x: i32) {
-        self.x = x;
-    }
+        match ctx.key {
+            Some(VirtualKeyCode::K) => {
+                let _ = stdout().flush();
+                let mut new_glyph = String::new();
+                stdin().read_line(&mut new_glyph).expect("Invalid input");
+                let n_glyph_char = new_glyph.trim().parse::<char>().unwrap() as u16;
+                self.picked_tile.glyph = n_glyph_char;
 
-    fn set_y(&mut self, y: i32) {
-        self.y = y;
-    }
+                new_glyph = String::new();
+                stdin().read_line(&mut new_glyph).expect("Invalid input");
 
-    fn set_display(&mut self, display: Display) {
-        self.d = display;
-    }
+                // Self::remove_trailing_new_line(&mut new_glyph);
+                let fg = new_glyph.split(",").map(|a| a.trim()).map(|a| a.parse::<u8>().unwrap()).collect::<Vec<u8>>();
+                let fg = (fg[0], fg[1], fg[2]);
 
-    fn move_by(&mut self, dx: i32, dy: i32) {
-        self.x += dx;
-        self.y += dy;
-    }
-}
+                new_glyph = String::new();
+                stdin().read_line(&mut new_glyph).expect("Invalid input");
 
-pub struct Camera {
-    x: i32,
-    y: i32,
-}
+                let bg = new_glyph.split(",").map(|a| a.trim()).map(|a| a.parse::<u8>().unwrap()).collect::<Vec<u8>>();
+                let bg = (bg[0], bg[1], bg[2]);
 
-impl Camera {
-    fn transform_point(&self, point: (i32, i32)) -> (i32, i32) {
-        (point.0 - self.x, point.1 - self.y)
-    }
-
-    fn untransform_point(&self, point: (i32, i32)) -> (i32, i32) {
-        (point.0 + self.x, point.1 + self.y)
-    }
-}
-
-pub struct EntityView {
-    name: String,
-    art: Rc<XpFile>,
-}
-
-impl EntityView {
-    fn make_text_builder(&self, builder: &mut TextBuilder) {
-        builder
-            .centered(self.name.as_str())
-            .ln();
+                self.picked_tile.bg = bg;
+                self.picked_tile.fg = fg;
+            }
+            Some(VirtualKeyCode::S) => {
+                self.export_to_file();
+            }
+            Some(VirtualKeyCode::L) => {
+                self.load_from_file();
+            }
+            Some(_) => {}
+            None => {}
+        }
     }
 }
 
@@ -293,6 +193,8 @@ pub struct State {
 
     free_slots: Vec<EntityIndex>,
 
+    map_width: i32,
+    map_height: i32,
     tiles: Vec<Cell<TileType>>,
 
     camera: RefCell<Camera>,
@@ -401,7 +303,8 @@ impl State {
                             let entity_id = entity.borrow().get_id();
                             match state.stat_blocks[entity_id].as_ref() {
                                 Some(e) => {
-                                    e.borrow_mut().take_damage(state, player_stats.atk);
+                                    e.borrow_mut()
+                                        .take_damage(state, player_stats.atk.get_total());
                                 }
                                 None => {}
                             }
@@ -420,7 +323,7 @@ impl State {
 
             match ai {
                 Some(ref mut ai) => {
-                    ai.on_turn(i, self);
+                    ai.on_turn(self);
                 }
                 None => {}
             }
@@ -430,24 +333,33 @@ impl State {
         }
     }
 
-    fn generate_map() -> Vec<Cell<TileType>> {
+    fn generate_map(width: i32, height: i32) -> Vec<Cell<TileType>> {
         let mut map = vec![];
-        for _ in 0..80 * 50 {
+        for _ in 0..width * height {
             if math_utils::chance(0.03) {
-                map.push(Cell::new(TileType::Wall));
+                map.push(Cell::new(TileType::Wall(Display {
+                    glyph: '^' as u16,
+                    fg: rltk::GREEN,
+                    bg: rltk::BLACK,
+                })));
             } else {
-                map.push(Cell::new(TileType::Floor));
+                map.push(Cell::new(TileType::Floor(Display {
+                    glyph: '.' as u16,
+                    fg: rltk::WHITE,
+                    bg: rltk::BLACK,
+                })));
             }
         }
         map
     }
 
     fn generate_entities(&mut self) {
-        for _ in 0..80 * 50 {
+        for _ in 0..(self.map_width * self.map_height) {
             if !math_utils::chance(0.01) {
                 continue;
             }
-            let pos = math_utils::random_point(0, 80, 0, 50);
+
+            let pos = math_utils::random_point(1, self.map_width-1, 1, self.map_height-1);
 
             if !math_utils::chance(0.3) {
                 entity_create::create_goblin(self, pos);
@@ -464,29 +376,44 @@ impl State {
             y: 1,
             d: Display {
                 glyph: '@' as u16,
-                fg: RGB::named(rltk::YELLOW),
-                bg: RGB::named(rltk::BLACK),
+                fg: rltk::YELLOW,
+                bg: rltk::BLACK,
             },
         };
 
         let f_c_dir = std::env::current_dir().unwrap();
 
+        let rc_load = |s: &'static str| {
+            Rc::new(
+                XpFile::read(
+                    &mut File::open(f_c_dir.join(s)).expect(
+                        format!(
+                            "Could not find the file: {}",
+                            f_c_dir.join(s).as_path().to_str().unwrap()
+                        )
+                        .as_str(),
+                    ),
+                )
+                .unwrap(),
+            )
+        };
+
+        let load_map = map_utils::load_from_file("output.map");
+
         let mut state = State {
-            tiles: State::generate_map(),
+            map_width: load_map.width,
+            map_height: load_map.height,
+            // tiles: State::generate_map(32, 32),
+            tiles: map_utils::map_to_cells(load_map.tiles),
             entities: vec![],
             ais: RefCell::new(vec![]),
             stat_blocks: vec![],
             entity_views: vec![],
             resources: vec![
-                Rc::new(
-                    XpFile::read(&mut File::open(f_c_dir.join("dude.png.xp")).unwrap()).unwrap(),
-                ),
-                Rc::new(
-                    XpFile::read(&mut File::open(f_c_dir.join("firelemental.xp")).unwrap()).unwrap(),
-                ),
-                Rc::new(
-                    XpFile::read(&mut File::open(f_c_dir.join("guard.xp")).unwrap()).unwrap(),
-                )
+                rc_load("dude.png.xp"),
+                rc_load("firelemental.xp"),
+                rc_load("guard.xp"),
+                rc_load("player.xp"),
             ],
             queued_destruction: RefCell::new(vec![]),
             free_slots: vec![],
@@ -502,28 +429,27 @@ impl State {
         state.add_entity(
             0,
             Some(Box::new(RefCell::new(player))),
-            None,
+            Some(Box::new(PlayerAI)),
             Some(RefCell::new(StatBlock {
                 id: 0,
-                hp: 10,
-                atk: 5,
+                hp: EntityStat::new("Hit Points", 10),
+                def: EntityStat::new("Defense", 3),
+                atk: EntityStat::new("Attack", 5),
                 ..Default::default()
             })),
-            None,
+            Some(Rc::new(EntityView {
+                name: "Me...".to_string(),
+                art: state.resources[3].clone(),
+            })),
         );
 
         state.generate_entities();
 
-        //Tiles is a flat square array make a wall around the edges of the square of TileType::Wall
-        for x in 0..80 {
-            state.set_tile(x, 0, TileType::Wall);
-            state.set_tile(x, 49, TileType::Wall);
-        }
-
-        for y in 0..50 {
-            state.set_tile(0, y, TileType::Wall);
-            state.set_tile(79, y, TileType::Wall);
-        }
+        let wall_tile = TileType::Wall(Display {
+            glyph: '#' as u16,
+            fg: rltk::CYAN,
+            bg: rltk::BLACK,
+        });
 
         state
     }
@@ -542,19 +468,24 @@ impl State {
     }
 
     fn xy_idx(&self, x: i32, y: i32) -> usize {
-        (y as usize * 80) + x as usize
+        (y as usize * self.map_width as usize) + x as usize
     }
 
+    #[allow(dead_code)]
     fn idx_xy(&self, idx: usize) -> (i32, i32) {
-        (idx as i32 % 80, idx as i32 / 80)
+        (idx as i32 % self.map_width, idx as i32 / self.map_width)
     }
 
     fn in_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0 && x < 80 && y >= 0 && y < 50
+        x >= 0 && x < self.map_width && y >= 0 && y < self.map_height
     }
 
     fn can_move(&self, x: i32, y: i32) -> bool {
-        self.in_bounds(x, y) && self.tiles[self.xy_idx(x, y)].get() == TileType::Floor
+        self.in_bounds(x, y)
+            && match self.tiles[self.xy_idx(x, y)].get() {
+                TileType::Floor(_) => true,
+                _ => false,
+            }
     }
 
     fn move_entity_by(&self, entity: EntityIndex, x: i32, y: i32) -> (i32, i32) {
@@ -579,30 +510,20 @@ impl State {
     }
 
     fn draw_map(&self, g_db: &mut DrawBatch) {
-        let l_x = math_utils::clamp(self.camera.borrow().x, 0, 80);
-        let h_x = math_utils::clamp(self.camera.borrow().x + 40, 0, 80);
-        let l_y = math_utils::clamp(self.camera.borrow().y, 0, 80);
-        let h_y = math_utils::clamp(self.camera.borrow().y + 40, 0, 50);
+        let l_x = math_utils::clamp(self.camera.borrow().x, 0, self.map_width);
+        let h_x = math_utils::clamp(self.camera.borrow().x + 40, 0, self.map_width);
+        let l_y = math_utils::clamp(self.camera.borrow().y, 0, self.map_height);
+        let h_y = math_utils::clamp(self.camera.borrow().y + 40, 0, self.map_height);
         for x in l_x..h_x {
             for y in l_y..h_y {
                 let tile = self.tiles[self.xy_idx(x, y)].get();
                 let (x, y) = self.camera.borrow().transform_point((x, y));
+
                 match tile {
-                    TileType::Floor => {
-                        g_db.set(
-                            Point::new(x, y),
-                            ColorPair::new(RGB::from_f32(0.5, 0.5, 0.5), RGB::from_f32(0., 0., 0.)),
-                            rltk::to_cp437('.'),
-                        );
+                    TileType::Floor(d) => {
+                        g_db.set(Point::new(x, y), ColorPair::new(d.fg, d.bg), d.glyph);
                     }
-                    TileType::Wall => {
-                        g_db.set(
-                            Point::new(x, y),
-                            ColorPair::new(RGB::from_f32(0., 1.0, 0.), RGB::from_f32(0., 0., 0.)),
-                            rltk::to_cp437('#'),
-                        );
-                    }
-                    TileType::Object(d) => {
+                    TileType::Wall(d) => {
                         g_db.set(Point::new(x, y), ColorPair::new(d.fg, d.bg), d.glyph);
                     }
                 }
@@ -753,6 +674,9 @@ impl GameState for State {
 
         if let Some(ref c_view_art) = self.currently_viewed_art {
             self.print_image_at(41, 20, c_view_art, ctx)
+        } else {
+            let player_art = self.entity_views[0].as_ref().unwrap();
+            self.print_image_at(41, 20, player_art, ctx)
         };
 
         //Clean up the queued disposed objects
@@ -766,5 +690,6 @@ impl GameState for State {
 fn main() -> BResult<()> {
     let context = BTermBuilder::simple(80, 40).unwrap().build()?;
     let gs = State::new();
+    // let gs = MapEditorState::new(32, 32);
     rltk::main_loop(context, gs)
 }
