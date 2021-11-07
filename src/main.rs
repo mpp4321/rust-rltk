@@ -553,10 +553,6 @@ impl State {
         x >= 0 && x < 80 && y >= 0 && y < 50
     }
 
-    fn in_screen_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0 && x < 40 && y >= 0 && y < 40
-    }
-
     fn can_move(&self, x: i32, y: i32) -> bool {
         self.in_bounds(x, y) && self.tiles[self.xy_idx(x, y)].get() == TileType::Floor
     }
