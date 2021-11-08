@@ -3,14 +3,16 @@ extern crate rltk;
 mod entities;
 mod structs;
 
-use entities::entity_create;
+use entities::{ entity_create };
 use structs::*;
 
 use serde::{Deserialize, Serialize};
+use structs::map_utils::MapDescriptor;
 
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
+use std::path::Path;
 use std::rc::Rc;
 
 use rltk::{
@@ -45,12 +47,21 @@ mod math_utils {
     }
 }
 
+//Describes an entity in the map editor
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MEEntity {
+    d: Display,
+    name: String,
+}
+
 pub struct MapEditorState {
     width: i32,
     height: i32,
 
     map_tiles: Vec<TileType>,
+    entities: Vec<Option<MEEntity>>,
     picked_tile: Display,
+    picked_entity: Option<MEEntity>,
 }
 
 impl MapEditorState {
@@ -66,6 +77,8 @@ impl MapEditorState {
                 });
                 (width * height) as usize
             ],
+            entities: vec![None; (width * height) as usize],
+            picked_entity: None,
             picked_tile: Display {
                 glyph: '.' as u16,
                 fg: rltk::WHITE,
@@ -98,24 +111,31 @@ impl MapEditorState {
         self.map_tiles[indx] = TileType::Wall(self.picked_tile);
     }
 
-    fn export_to_file(&self) {
-        let mut file = File::create("output.map").unwrap();
-        let s_str = serde_json::to_string(&self.map_tiles).unwrap();
-        file.write(s_str.as_bytes()).unwrap();
+    fn handle_e_click(&mut self, pos: (i32, i32)) {
+        if !self.in_bounds(pos) {
+            return;
+        }
+        let indx = self.xy_idx(pos.0, pos.1);
+        self.entities[indx] = self.picked_entity.clone();
     }
 
-    fn load_from_file(&mut self) {
-        let mut file = File::open("output.map").unwrap();
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).unwrap();
-        let map_tiles: Vec<TileType> = serde_json::from_str(&contents).unwrap();
-        self.map_tiles = map_tiles;
+    fn export_to_file(&self) {
+        let mut file = File::create("output.map").unwrap();
+        let s_str = serde_json::to_string(&MapDescriptor {
+            tiles: self.map_tiles.clone(),
+            width: self.width,
+            height: self.height,
+            entities: self.entities.clone(),
+        })
+        .unwrap();
+        file.write(s_str.as_bytes()).unwrap();
     }
 
     fn draw_map(&self, ctx: &mut Rltk) {
         for i in 0..self.width {
             for j in 0..self.height {
                 let idx = self.xy_idx(i, j);
+
                 match self.map_tiles[idx] {
                     TileType::Floor(ref t) => {
                         ctx.set(i, j, t.fg, t.bg, t.glyph);
@@ -123,11 +143,26 @@ impl MapEditorState {
                     TileType::Wall(ref t) => {
                         ctx.set(i, j, t.fg, t.bg, t.glyph);
                     }
+                    TileType::Portal(ref t, _, _, _) => {
+                        ctx.set(i, j, t.fg, t.bg, t.glyph);
+                    }
+                }
+
+                match self.entities[idx] {
+                    Some(ref e) => {
+                        ctx.set(i, j, e.d.fg, e.d.bg, e.d.glyph);
+                    }
+                    None => {}
                 }
             }
         }
     }
 
+    fn get_input(&self) -> String {
+        let mut input = String::new();
+        stdin().read_line(&mut input).expect("Failed to read line");
+        input.trim().to_string()
+    }
 }
 
 impl GameState for MapEditorState {
@@ -141,7 +176,11 @@ impl GameState for MapEditorState {
         let a = &rltk::INPUT;
         let right_click = a.lock().is_mouse_button_pressed(1);
         if ctx.left_click {
-            self.handle_l_click(mouse_pos);
+            if ctx.shift {
+                self.handle_e_click(mouse_pos);
+            } else {
+                self.handle_l_click(mouse_pos);
+            }
         } else if right_click {
             self.handle_r_click(mouse_pos);
         }
@@ -158,23 +197,98 @@ impl GameState for MapEditorState {
                 stdin().read_line(&mut new_glyph).expect("Invalid input");
 
                 // Self::remove_trailing_new_line(&mut new_glyph);
-                let fg = new_glyph.split(",").map(|a| a.trim()).map(|a| a.parse::<u8>().unwrap()).collect::<Vec<u8>>();
+                let fg = new_glyph
+                    .split(",")
+                    .map(|a| a.trim())
+                    .map(|a| a.parse::<u8>().unwrap())
+                    .collect::<Vec<u8>>();
                 let fg = (fg[0], fg[1], fg[2]);
 
                 new_glyph = String::new();
                 stdin().read_line(&mut new_glyph).expect("Invalid input");
 
-                let bg = new_glyph.split(",").map(|a| a.trim()).map(|a| a.parse::<u8>().unwrap()).collect::<Vec<u8>>();
+                let bg = new_glyph
+                    .split(",")
+                    .map(|a| a.trim())
+                    .map(|a| a.parse::<u8>().unwrap())
+                    .collect::<Vec<u8>>();
                 let bg = (bg[0], bg[1], bg[2]);
 
                 self.picked_tile.bg = bg;
                 self.picked_tile.fg = fg;
             }
+            Some(VirtualKeyCode::R) => {
+                let idx = self.xy_idx(mouse_pos.0, mouse_pos.1);
+                self.entities[idx] = None;
+            }
+            Some(VirtualKeyCode::E) => {
+                let _ = stdout().flush();
+                let entity_name = self.get_input();
+                let entity_display = match entity_name.as_str() {
+                    "Goblin" => Display {
+                        glyph: 'g' as u16,
+                        fg: rltk::BLACK,
+                        bg: rltk::RED,
+                    },
+                    "SFElemental" => Display {
+                        glyph: '*' as u16,
+                        fg: rltk::BLACK,
+                        bg: rltk::RED,
+                    },
+                    "Spider" => Display {
+                        glyph: 's' as u16,
+                        fg: rltk::BLACK,
+                        bg: rltk::RED,
+                    },
+                    "KSpider" => Display {
+                        glyph: 'S' as u16,
+                        fg: rltk::BLACK,
+                        bg: rltk::RED,
+                    },
+                    _ => panic!("Unknown entity!"),
+                };
+                self.picked_entity = Some(MEEntity {
+                    name: entity_name,
+                    d: entity_display,
+                });
+            }
             Some(VirtualKeyCode::S) => {
                 self.export_to_file();
             }
             Some(VirtualKeyCode::L) => {
-                self.load_from_file();
+                let md = structs::map_utils::load_from_file("output.map");
+                self.map_tiles = md.tiles;
+                self.width = md.width;
+                self.height = md.height;
+                self.entities = md.entities;
+            }
+            Some(VirtualKeyCode::P) => {
+                let pos = mouse_pos;
+                if self.in_bounds(pos) {
+                    let idx = self.xy_idx(pos.0, pos.1);
+                    self.picked_tile = match self.map_tiles[idx] {
+                        TileType::Floor(ref t) => t.clone(),
+                        TileType::Wall(ref t) => t.clone(),
+                        TileType::Portal(ref t, _, _, _) => t.clone()
+                    };
+                }
+            }
+            Some(VirtualKeyCode::F) => {
+                //Fill map with current tile as floor
+                for i in 0..self.width {
+                    for j in 0..self.height {
+                        let idx = self.xy_idx(i, j);
+                        self.map_tiles[idx] = TileType::Floor(self.picked_tile.clone());
+                    }
+                }
+            }
+            Some(VirtualKeyCode::A) => {
+                let _ = stdout().flush();
+                let portal_dir = self.get_input().parse::<usize>().unwrap();
+                let x = self.get_input().parse::<i32>().unwrap();
+                let y = self.get_input().parse::<i32>().unwrap();
+                let idx = self.xy_idx(mouse_pos.0, mouse_pos.1);
+                self.map_tiles[idx] = TileType::Portal(self.picked_tile.clone(), portal_dir, x, y);
             }
             Some(_) => {}
             None => {}
@@ -188,6 +302,7 @@ pub struct State {
     stat_blocks: Vec<Option<RefCell<StatBlock>>>,
     entity_views: Vec<Option<Rc<EntityView>>>,
     resources: Vec<Rc<XpFile>>,
+    entity_loots: Vec<Option<Box<RefCell<dyn EntityLootHandler>>>>,
 
     queued_destruction: RefCell<Vec<EntityIndex>>,
 
@@ -204,6 +319,11 @@ pub struct State {
 
     currently_viewed_art: Option<Rc<EntityView>>,
     currently_viewed_stat_block: Option<StatBlock>,
+
+    until_player_save: f32,
+
+    portal_locations: Vec<&'static str>,
+    destination_next_tick: RefCell<Option<(usize, i32, i32)>>
 }
 
 impl State {
@@ -240,7 +360,8 @@ impl State {
         self.entities.insert(index, entity);
         self.ais.borrow_mut().insert(index, ai);
         self.stat_blocks.insert(index, stat_block);
-        self.entity_views.insert(index, view)
+        self.entity_views.insert(index, view);
+        self.entity_loots.insert(index, None);
     }
 
     fn handle_directional_input(&mut self, key: VirtualKeyCode) -> bool {
@@ -273,6 +394,8 @@ impl State {
 
     fn handle_movement_input(&mut self, key: VirtualKeyCode, do_tick: &mut bool) {
         match key {
+            VirtualKeyCode::S => self.save_player(),
+
             VirtualKeyCode::Up => self.move_player_by(0, -1),
             VirtualKeyCode::Down => self.move_player_by(0, 1),
             VirtualKeyCode::Left => self.move_player_by(-1, 0),
@@ -299,12 +422,15 @@ impl State {
                         let (ex, ey) = (entity.borrow().get_x(), entity.borrow().get_y());
                         if ex == px && ey == py {
                             //Callback here
-                            let player_stats = state.stat_blocks[0].as_ref().unwrap().borrow();
+                            let dmg = {
+                                let player_stats = state.stat_blocks[0].as_ref().unwrap().borrow();
+                                player_stats.atk.get_total()
+                            };
                             let entity_id = entity.borrow().get_id();
                             match state.stat_blocks[entity_id].as_ref() {
                                 Some(e) => {
                                     e.borrow_mut()
-                                        .take_damage(state, player_stats.atk.get_total());
+                                        .take_damage(state, dmg);
                                 }
                                 None => {}
                             }
@@ -359,7 +485,7 @@ impl State {
                 continue;
             }
 
-            let pos = math_utils::random_point(1, self.map_width-1, 1, self.map_height-1);
+            let pos = math_utils::random_point(1, self.map_width - 1, 1, self.map_height - 1);
 
             if !math_utils::chance(0.3) {
                 entity_create::create_goblin(self, pos);
@@ -367,6 +493,18 @@ impl State {
                 entity_create::create_fire_elemental(self, pos);
             }
         }
+    }
+
+    fn load_entities_from_map(state: &mut State, entities: &Vec<Option<MEEntity>>) {
+        for load_entity in entities.iter().enumerate() {
+            if !load_entity.1.is_some() {
+                continue;
+            }
+            let (x, y) = state.idx_xy(load_entity.0);
+            let m_entity = load_entity.1.as_ref().unwrap();
+            entity_create::resolve_entity_string(state, (x, y), m_entity.name.as_str());
+        }
+
     }
 
     fn new() -> State {
@@ -409,47 +547,64 @@ impl State {
             ais: RefCell::new(vec![]),
             stat_blocks: vec![],
             entity_views: vec![],
+            entity_loots: vec![],
             resources: vec![
-                rc_load("dude.png.xp"),
-                rc_load("firelemental.xp"),
-                rc_load("guard.xp"),
-                rc_load("player.xp"),
+                rc_load("dude.png.xp"), //0
+                rc_load("firelemental.xp"), //1
+                rc_load("guard.xp"),  //2
+                rc_load("player.xp"), //3
+                rc_load("spider.xp"), //4
+                rc_load("kingspider.xp"), //5
             ],
             queued_destruction: RefCell::new(vec![]),
             free_slots: vec![],
 
-            camera: RefCell::new(Camera { x: -20, y: -20 }),
+            camera: RefCell::new(Camera::new(-20, -20)),
 
             waiting_for_directional_input: false,
             directional_callback: None,
             currently_viewed_art: None,
             currently_viewed_stat_block: None,
+
+            until_player_save: 10.0,
+
+            portal_locations: vec![
+                "output.map"
+            ],
+            destination_next_tick: RefCell::new(None),
+        };
+
+        let player_stat_block: StatBlock = {
+            if Path::new("player.json").exists() {
+                let mut file = File::open("player.json").unwrap();
+                let mut string_buf = String::new();
+                file.read_to_string(&mut string_buf).unwrap();
+                serde_json::from_str(&string_buf).unwrap()
+            } else {
+                StatBlock {
+                    id: 0,
+                    hp: EntityStat::new("Hit Points", 10),
+                    def: EntityStat::new("Defense", 3),
+                    atk: EntityStat::new("Attack", 5),
+                    ..Default::default()
+                }
+            }
         };
 
         state.add_entity(
             0,
             Some(Box::new(RefCell::new(player))),
             Some(Box::new(PlayerAI)),
-            Some(RefCell::new(StatBlock {
-                id: 0,
-                hp: EntityStat::new("Hit Points", 10),
-                def: EntityStat::new("Defense", 3),
-                atk: EntityStat::new("Attack", 5),
-                ..Default::default()
-            })),
+            Some(RefCell::new(player_stat_block)),
             Some(Rc::new(EntityView {
                 name: "Me...".to_string(),
                 art: state.resources[3].clone(),
             })),
         );
 
-        state.generate_entities();
+        Self::load_entities_from_map(&mut state, &load_map.entities);
 
-        let wall_tile = TileType::Wall(Display {
-            glyph: '#' as u16,
-            fg: rltk::CYAN,
-            bg: rltk::BLACK,
-        });
+        // state.generate_entities();
 
         state
     }
@@ -483,9 +638,46 @@ impl State {
     fn can_move(&self, x: i32, y: i32) -> bool {
         self.in_bounds(x, y)
             && match self.tiles[self.xy_idx(x, y)].get() {
-                TileType::Floor(_) => true,
-                _ => false,
+                TileType::Wall(_) => false,
+                _ => true,
             }
+    }
+
+    fn load_map_by_destination(&mut self, destination: usize, x: i32, y: i32) {
+        // TFW you wish you were using an ECS :(
+
+        *self.destination_next_tick.borrow_mut() = None;
+
+        println!("{} {}", x, y);
+
+        let x_map = self.portal_locations[destination];
+        let load_map = map_utils::load_from_file(x_map);
+
+        self.map_width = load_map.width;
+        self.map_height = load_map.height;
+
+        self.tiles = map_utils::map_to_cells(load_map.tiles);
+        let mut _entity_0 = std::mem::take(&mut self.entities[0]);
+        _entity_0.as_ref().unwrap().borrow_mut().set_x(x);
+        _entity_0.as_ref().unwrap().borrow_mut().set_y(y);
+        self.entities = vec![_entity_0];
+        {
+            let mut ais_arr = self.ais.borrow_mut();
+            let _ais_0 = std::mem::take(&mut ais_arr[0]);
+            *ais_arr = vec![_ais_0];
+        }
+        let _stat_block_0 = std::mem::take(&mut self.stat_blocks[0]);
+        self.stat_blocks = vec![_stat_block_0];
+        let _entity_view_0 = std::mem::take(&mut self.entity_views[0]);
+        self.entity_views = vec![_entity_view_0];
+        let _entity_loot_0 = std::mem::take(&mut self.entity_loots[0]);
+        self.entity_loots = vec![_entity_loot_0];
+
+        self.free_slots = vec![];
+
+        Self::load_entities_from_map(self, &load_map.entities);
+
+        self.camera.borrow_mut().update_xy(x, y);
     }
 
     fn move_entity_by(&self, entity: EntityIndex, x: i32, y: i32) -> (i32, i32) {
@@ -504,16 +696,23 @@ impl State {
         let deltas = self.move_entity_by(0, x, y);
         {
             let mut cm = self.camera.borrow_mut();
-            cm.x += deltas.0;
-            cm.y += deltas.1;
+            cm.dx += deltas.0;
+            cm.dy += deltas.1;
+        }
+        let plyr = self.get_entity(0).borrow_mut();
+        let (x, y) = (plyr.get_x(), plyr.get_y());
+        let idx_of = self.xy_idx(x, y);
+        if let TileType::Portal(_, destination, x, y) = self.tiles[idx_of].get() {
+            *self.destination_next_tick.borrow_mut() = Some((destination, x, y));
         }
     }
 
     fn draw_map(&self, g_db: &mut DrawBatch) {
-        let l_x = math_utils::clamp(self.camera.borrow().x, 0, self.map_width);
-        let h_x = math_utils::clamp(self.camera.borrow().x + 40, 0, self.map_width);
-        let l_y = math_utils::clamp(self.camera.borrow().y, 0, self.map_height);
-        let h_y = math_utils::clamp(self.camera.borrow().y + 40, 0, self.map_height);
+        let l_x = math_utils::clamp(self.camera.borrow().mod_x(), 0, self.map_width);
+        let h_x = math_utils::clamp(self.camera.borrow().mod_x() + 40, 0, self.map_width);
+        let l_y = math_utils::clamp(self.camera.borrow().mod_y(), 0, self.map_height);
+        let h_y = math_utils::clamp(self.camera.borrow().mod_y() + 40, 0, self.map_height);
+
         for x in l_x..h_x {
             for y in l_y..h_y {
                 let tile = self.tiles[self.xy_idx(x, y)].get();
@@ -524,6 +723,9 @@ impl State {
                         g_db.set(Point::new(x, y), ColorPair::new(d.fg, d.bg), d.glyph);
                     }
                     TileType::Wall(d) => {
+                        g_db.set(Point::new(x, y), ColorPair::new(d.fg, d.bg), d.glyph);
+                    }
+                    TileType::Portal(d, _, _, _) => {
                         g_db.set(Point::new(x, y), ColorPair::new(d.fg, d.bg), d.glyph);
                     }
                 }
@@ -576,12 +778,39 @@ impl State {
             }
         }
     }
+
+    fn save_player(&self) {
+        let mut file = File::create("player.json").unwrap();
+        let string_buf = serde_json::to_string(&self.stat_blocks[0].unwrap_ref().clone()).unwrap();
+        file.write(string_buf.as_bytes()).expect("Failed to write to player.json");
+    }
 }
 
 impl GameState for State {
     fn tick(&mut self, ctx: &mut Rltk) {
+
+        let destination_tick_info = {
+            if let Some((destination, x, y)) = *self.destination_next_tick.borrow_mut() {
+                Some((destination, x, y))
+            } else {
+                None
+            }
+        };
+
+        if let Some((destination, x, y)) =  destination_tick_info {
+            self.load_map_by_destination(destination, x, y)
+        }
+
         let mut g_db = DrawBatch::new();
         g_db.cls();
+
+        self.camera.borrow_mut().tween_tick(ctx.frame_time_ms);
+
+        self.until_player_save -= ctx.frame_time_ms / 1000.0;
+        if self.until_player_save <= 0.0 {
+            self.until_player_save = 30.0;
+            self.save_player();
+        }
 
         // Draw a line down x = 41 of |
         for y in 0..50 {
@@ -594,10 +823,11 @@ impl GameState for State {
 
         //Render Stat info
         {
-            let mut stat_block_to_draw = *self.stat_blocks[0].unwrap_ref();
-            if !self.currently_viewed_stat_block.is_none() {
-                stat_block_to_draw = self.currently_viewed_stat_block.unwrap();
-            }
+            let mut stat_block_to_draw = if !self.currently_viewed_stat_block.is_none() {
+                self.currently_viewed_stat_block.as_ref().unwrap().clone()
+            } else {
+                self.stat_blocks[0].unwrap_ref().clone()
+            };
 
             //Draw the stat block in a TextBlock
 
@@ -634,7 +864,7 @@ impl GameState for State {
                     }
 
                     if let Some(stat_block) = stat_bl {
-                        self.currently_viewed_stat_block = Some(*stat_block.borrow());
+                        self.currently_viewed_stat_block = Some(stat_block.borrow().clone());
                     }
                 }
             }
@@ -689,7 +919,18 @@ impl GameState for State {
 
 fn main() -> BResult<()> {
     let context = BTermBuilder::simple(80, 40).unwrap().build()?;
-    let gs = State::new();
-    // let gs = MapEditorState::new(32, 32);
-    rltk::main_loop(context, gs)
+
+    //Ask the user for a number and then get it from stdin
+    let mut gametype = String::new();
+    println!("Type 0 for normal game 1 for map editor");
+    std::io::stdin().read_line(&mut gametype)?;
+    let gametype = gametype.trim().parse::<i32>().unwrap();
+
+    if gametype == 0 {
+        let gs = State::new();
+        rltk::main_loop(context, gs)
+    } else {
+        let gs = MapEditorState::new(32, 32);
+        rltk::main_loop(context, gs)
+    }
 }

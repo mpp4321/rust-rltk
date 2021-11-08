@@ -11,6 +11,8 @@ pub mod map_utils {
     use std::{cell::Cell, fs::File, io::Read};
     use serde::{Deserialize, Serialize};
 
+    use crate::MEEntity;
+
     use super::TileType;
 
     #[derive(Serialize, Deserialize)]
@@ -18,6 +20,7 @@ pub mod map_utils {
         pub width: i32,
         pub height: i32,
         pub tiles: Vec<TileType>,
+        pub entities: Vec<Option<MEEntity>>,
     }
 
     pub fn load_from_file(file_name: &'static str) -> MapDescriptor {
@@ -33,9 +36,9 @@ pub mod map_utils {
     }
 }
 
-#[derive(PartialEq, Copy, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct EntityStat {
-    name: &'static str,
+    name: String,
     base: i32,
     bonus: i32,
     max: i32,
@@ -56,9 +59,21 @@ impl EntityStat {
         self.base + self.bonus
     }
 
+    pub fn get_base(&self) -> i32 {
+        self.base
+    }
+
+    pub fn get_max(&self) -> i32 {
+        self.max
+    }
+
+    pub fn set_max(&mut self, max: i32) {
+        self.max = max;
+    }
+
     pub fn new(name: &'static str, start: i32) -> Self {
         EntityStat {
-            name,
+            name: String::from(name),
             base: start,
             bonus: 0,
             max: start,
@@ -76,6 +91,7 @@ impl EntityStat {
 pub enum TileType {
     Wall(Display),
     Floor(Display),
+    Portal(Display, usize, i32, i32)
 }
 
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,7 +166,7 @@ pub struct BasicEntity {
 }
 
 //Entities with stat blocks and complex interactions etc
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatBlock {
     pub id: EntityIndex,
 
@@ -190,7 +206,7 @@ impl StatBlock {
     pub fn take_damage(&mut self, state: &State, damage: i32) -> bool {
         self.hp.decrement(max(0, damage - self.def.get_total()) );
 
-        if self.hp.get_total() <= 0 {
+        if self.hp.get_total() <= 0 && !self.dead {
             self.dead = true;
             state.ais.borrow_mut()[self.id] = Some(Box::new(SelfDestructAI { id: self.get_id(), turns_left: 5 }));
             state.get_entity(self.id).borrow_mut().set_display(Display {
@@ -198,6 +214,11 @@ impl StatBlock {
                 fg: rltk::RED,
                 bg: rltk::BLACK
             });
+
+            if state.entity_loots[self.id].is_some() {
+                let mut e_loot = state.entity_loots[self.id].as_ref().unwrap().borrow_mut();
+                e_loot.handle_loot(state);
+            }
 
             return true;
         }
@@ -235,6 +256,7 @@ pub trait MyOptionTimeSaver<T> {
 }
 
 impl<T> MyOptionTimeSaver<T> for Option<RefCell<T>> {
+
     fn unwrap_ref(&self) -> Ref<T> {
         self.as_ref().unwrap().borrow()
     }
@@ -242,6 +264,7 @@ impl<T> MyOptionTimeSaver<T> for Option<RefCell<T>> {
     fn unwrap_ref_mut(&self) -> RefMut<T> {
         self.as_ref().unwrap().borrow_mut()
     }
+
 }
 
 impl EntityAI for ZombieAI {
@@ -323,13 +346,82 @@ impl Entity for BasicEntity {
 }
 
 pub struct Camera {
-    pub x: i32,
-    pub y: i32,
+    x: i32,
+    y: i32,
+
+    pub x_offset: i32,
+    pub y_offset: i32,
+
+    pub dx: i32,
+    pub dy: i32,
+
+    pub time_till_tween: f32,
 }
 
 impl Camera {
+    pub fn update_xy(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
+
+        self.dx = 0;
+        self.dy = 0;
+    }
+
+    pub fn new(xoff: i32, yoff: i32) -> Camera {
+        Camera {
+            x: 0,
+            y: 0,
+            x_offset: xoff,
+            y_offset: yoff,
+            dx: 0,
+            dy: 0,
+            time_till_tween: 0.2,
+        }
+    }
+
+    pub fn mod_x(&self) -> i32 {
+        return self.x + self.x_offset;
+    }
+
+    pub fn mod_y(&self) -> i32 {
+        return self.y + self.y_offset;
+    }
+
+    pub fn get_x(&self) -> i32 {
+        return self.x;
+    }
+
+    pub fn get_y(&self) -> i32 {
+        return self.y;
+    }
+
+    pub fn tween_tick(&mut self, dt_ms: f32) {
+        self.time_till_tween -= dt_ms / 1000.0;
+        if self.time_till_tween <= 0.0 {
+            self.time_till_tween = 0.2;
+
+            //Move the camera's x, y towards the dx, dy by 1 unit
+            let dx_unit = self.dx / max(1, self.dx.abs());
+            let dy_unit = self.dy / max(1, self.dy.abs());
+
+            if dx_unit == 0 && dy_unit == 0 {
+                self.time_till_tween = 0.5;
+            }
+
+            self.dx -= dx_unit;
+            self.dy -= dy_unit;
+
+            self.x += dx_unit;
+            self.y += dy_unit;
+        }
+    }
+}
+
+impl Camera {
+
+    //Transforms a world point into a screen point
     pub fn transform_point(&self, point: (i32, i32)) -> (i32, i32) {
-        (point.0 - self.x, point.1 - self.y)
+        (point.0 - self.x_offset - self.x, point.1 - self.y_offset - self.y)
     }
 
     // fn untransform_point(&self, point: (i32, i32)) -> (i32, i32) {
@@ -345,5 +437,40 @@ pub struct EntityView {
 impl EntityView {
     pub fn make_text_builder(&self, builder: &mut TextBuilder) {
         builder.centered(self.name.as_str()).ln();
+    }
+}
+pub trait EntityLootHandler {
+    fn get_id(&self) -> EntityIndex;
+    fn handle_loot(&mut self, state: &crate::State);
+}
+
+pub struct SpiderLoot { pub id: EntityIndex, pub max_atk: i32}
+
+impl EntityLootHandler for SpiderLoot {
+    fn get_id(&self) -> EntityIndex {
+        self.id
+    }
+
+    fn handle_loot(&mut self, state: &crate::State) {
+        if math_utils::chance(0.3) {
+            //Improve player's atk up to 5
+            let mut player_stats = state
+                .stat_blocks[0]
+                .unwrap_ref_mut();
+
+            let hp_cur_max = player_stats.hp.get_max();
+            if hp_cur_max < 30 {
+                player_stats.hp.set_max(
+                    hp_cur_max + 1
+                );
+            }
+
+            let atk_cur_max = player_stats.atk.get_max();
+            if atk_cur_max < self.max_atk {
+                player_stats.atk.set(
+                    atk_cur_max + 1
+                );
+            }
+        }
     }
 }

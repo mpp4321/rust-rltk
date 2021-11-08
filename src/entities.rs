@@ -1,3 +1,7 @@
+use std::borrow::BorrowMut;
+
+use crate::{EntityIndex, math_utils};
+
 pub mod entity_create {
     use crate::*;
 
@@ -17,6 +21,16 @@ pub mod entity_create {
         ($($x:tt)*) => {
             Some(Rc::new($($x)*))
         };
+    }
+
+    pub fn resolve_entity_string(state: &mut State, pos: (i32, i32), str_e: &str) {
+        match str_e {
+            "Goblin" => create_goblin(state, pos),
+            "SFElemental" => create_fire_elemental(state, pos),
+            "Spider" => create_spider(state, pos),
+            "KSpider" => create_king_spider(state, pos),
+            _ => panic!("Entity not able to be resolved")
+        }
     }
 
     fn basic_en(
@@ -84,6 +98,82 @@ pub mod entity_create {
             somerefcell!(stat_component),
             entity_view,
         );
+    }
+
+    pub fn create_king_spider(state: &mut State, pos: (i32, i32)) {
+        let entity_id = state.consume_free_slot();
+
+        let entity_component = basic_en(entity_id, pos, 'S' as u16, rltk::BURLYWOOD, rltk::BROWN2);
+        let ai_component = ZombieAI { id: entity_id };
+
+        let mut stat_component = StatBlock {
+            id: entity_id,
+            ..Default::default()
+        };
+
+        stat_component.hp.set(24);
+        stat_component.def.set(3);
+        stat_component.atk.set(7);
+
+        let goblin_man_art = state.resources[5].clone();
+
+        add_entity(
+            state,
+            entity_component,
+            entity_id,
+            ai_component,
+            stat_component,
+            somerc!(
+                EntityView {
+                    name: String::from("King Spider"),
+                    art: goblin_man_art.clone()
+                }
+            )
+        );
+
+        state.entity_loots[entity_id] = somebox!(RefCell::new(
+            SpiderLoot {
+                id: entity_id,
+                max_atk: 10
+            }
+        ));
+    }
+
+    pub fn create_spider(state: &mut State, pos: (i32, i32)) {
+        let entity_id = state.consume_free_slot();
+
+        let entity_component = basic_en(entity_id, pos, 's' as u16, rltk::BURLYWOOD, rltk::BROWN1);
+        let ai_component = ZombieAI { id: entity_id };
+
+        let mut stat_component = StatBlock {
+            id: entity_id,
+            ..Default::default()
+        };
+
+        stat_component.hp.set(12);
+        stat_component.def.set(1);
+        stat_component.atk.set(1);
+
+        let art = state.resources[4].clone();
+        add_entity(
+            state,
+            entity_component,
+            entity_id,
+            ai_component,
+            stat_component,
+            somerc!(
+                EntityView {
+                    name: String::from("Spider"),
+                    art: art.clone()
+                }
+            )
+        );
+        state.entity_loots[entity_id] = somebox!(RefCell::new(
+            SpiderLoot {
+                id: entity_id,
+                max_atk: 5
+            }
+        ));
     }
 
     pub fn create_goblin(state: &mut State, pos: (i32, i32)) {
