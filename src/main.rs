@@ -247,7 +247,11 @@ impl GameState for MapEditorState {
                         fg: rltk::BLACK,
                         bg: rltk::RED,
                     },
-                    _ => panic!("Unknown entity!"),
+                    _ => Display {
+                        glyph: '?' as u16,
+                        fg: rltk::BLACK,
+                        bg: rltk::RED,
+                    },
                 };
                 self.picked_entity = Some(MEEntity {
                     name: entity_name,
@@ -439,7 +443,7 @@ impl State {
 
             VirtualKeyCode::Key1 => {
                 self.waiting_for_directional_input = true;
-                self.directional_callback = Some(DirectionalInputTypes::Attack)
+                self.directional_callback = Some(DirectionalInputTypes::Attack);
                 *do_tick = false;
             }
             _ => {
@@ -555,7 +559,7 @@ impl State {
             )
         };
 
-        let load_map = map_utils::load_from_file("output.map");
+        let load_map = map_utils::load_from_file("main.map");
 
         let mut state = State {
             ecs: World::new(),
@@ -571,6 +575,9 @@ impl State {
                 arc_load("player.xp"), //3
                 arc_load("spider.xp"), //4
                 arc_load("kingspider.xp"), //5
+                arc_load("rockdude.xp"), //6
+                arc_load("tall dude.xp"), //7
+                arc_load("crazyeyes.xp"), //8
             ],
             queued_destruction: RefCell::new(vec![]),
 
@@ -584,7 +591,8 @@ impl State {
             until_player_save: 10.0,
 
             portal_locations: vec![
-                "output.map"
+                "main.map",
+                "portal_land.map"
             ],
             destination_next_tick: RefCell::new(None),
         };
