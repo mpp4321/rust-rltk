@@ -3,24 +3,25 @@ extern crate rltk;
 mod entities;
 mod structs;
 
-use entities::{ entity_create };
+use entities::entity_create;
+use hecs::{Ref, RefMut, World};
 use structs::*;
 
 use serde::{Deserialize, Serialize};
 use structs::map_utils::MapDescriptor;
-
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
+use std::ops::DerefMut;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rltk::{
     BResult, BTermBuilder, ColorPair, DrawBatch, GameState, Point, Rltk, TextBlock, TextBuilder,
     VirtualKeyCode, XpFile, RGB,
 };
 
-pub type EntityIndex = usize;
+pub type EntityIndex = hecs::Entity;
 
 mod math_utils {
     use rand::Rng;
@@ -39,6 +40,7 @@ mod math_utils {
         return rand::thread_rng().gen::<f32>() < f;
     }
 
+    #[allow(dead_code)]
     pub fn random_point(x1: i32, x2: i32, y1: i32, y2: i32) -> (i32, i32) {
         let mut rng = rand::thread_rng();
         let x = rng.gen_range(x1..x2);
@@ -296,29 +298,32 @@ impl GameState for MapEditorState {
     }
 }
 
+// Main game state
 pub struct State {
-    entities: Vec<Option<Box<RefCell<dyn Entity>>>>,
-    ais: RefCell<Vec<Option<Box<dyn EntityAI>>>>,
-    stat_blocks: Vec<Option<RefCell<StatBlock>>>,
-    entity_views: Vec<Option<Rc<EntityView>>>,
-    resources: Vec<Rc<XpFile>>,
-    entity_loots: Vec<Option<Box<RefCell<dyn EntityLootHandler>>>>,
+
+    ecs: World,
+
+    // entities: Vec<Option<Box<RefCell<dyn Entity>>>>,
+    // ais: RefCell<Vec<Option<Box<dyn EntityAI>>>>,
+    // stat_blocks: Vec<Option<RefCell<StatBlock>>>,
+    // entity_views: Vec<Option<Rc<EntityView>>>,
+    resources: Vec<Arc<XpFile>>,
+    // entity_loots: Vec<Option<Box<RefCell<dyn EntityLootHandler>>>>,
 
     queued_destruction: RefCell<Vec<EntityIndex>>,
 
-    free_slots: Vec<EntityIndex>,
-
     map_width: i32,
     map_height: i32,
+
     tiles: Vec<Cell<TileType>>,
 
     camera: RefCell<Camera>,
 
     waiting_for_directional_input: bool,
-    directional_callback: Option<fn(&State, i32, i32)>,
+    directional_callback: Option<DirectionalInputTypes>,
 
-    currently_viewed_art: Option<Rc<EntityView>>,
-    currently_viewed_stat_block: Option<StatBlock>,
+    currently_viewed_art: Option<EntityIndex>,
+    currently_viewed_stat_block: Option<EntityIndex>,
 
     until_player_save: f32,
 
@@ -331,37 +336,16 @@ impl State {
         ctx.render_xp_sprite(&entity_view.art, x, y);
     }
 
+    fn get_player_view(&self) -> Ref<EntityView> {
+        self.ecs.get::<EntityView>(self.get_player_id()).expect("Failed to get player view.")
+    }
+
     pub fn queue_destruction(&self, slot: EntityIndex) {
         self.queued_destruction.borrow_mut().push(slot);
     }
 
     pub fn dispose_slot(&mut self, slot: EntityIndex) {
-        self.entities[slot] = None;
-        self.stat_blocks[slot] = None;
-        self.ais.borrow_mut()[slot] = None;
-        self.free_slots.push(slot);
-    }
-
-    pub fn consume_free_slot(&mut self) -> EntityIndex {
-        if self.free_slots.len() > 0 {
-            return self.free_slots.pop().unwrap();
-        }
-        return self.entities.len();
-    }
-
-    pub fn add_entity(
-        &mut self,
-        index: EntityIndex,
-        entity: Option<Box<RefCell<dyn Entity>>>,
-        ai: Option<Box<dyn EntityAI>>,
-        stat_block: Option<RefCell<StatBlock>>,
-        view: Option<Rc<EntityView>>,
-    ) {
-        self.entities.insert(index, entity);
-        self.ais.borrow_mut().insert(index, ai);
-        self.stat_blocks.insert(index, stat_block);
-        self.entity_views.insert(index, view);
-        self.entity_loots.insert(index, None);
+        self.ecs.despawn(slot).expect("Failed to dispose of entity");
     }
 
     fn handle_directional_input(&mut self, key: VirtualKeyCode) -> bool {
@@ -372,23 +356,65 @@ impl State {
             self.waiting_for_directional_input = false;
             return false;
         }
+        let mut input_dir: Option<(i32, i32)> = None;
         match key {
-            VirtualKeyCode::Up => self.directional_callback.unwrap()(self, 0, -1),
-            VirtualKeyCode::Down => self.directional_callback.unwrap()(self, 0, 1),
-            VirtualKeyCode::Left => self.directional_callback.unwrap()(self, -1, 0),
-            VirtualKeyCode::Right => self.directional_callback.unwrap()(self, 1, 0),
+            VirtualKeyCode::Up => input_dir = Some( (0, -1) ),
+            VirtualKeyCode::Down => input_dir = Some( (0, 1) ),
+            VirtualKeyCode::Left => input_dir = Some( (-1, 0) ),
+            VirtualKeyCode::Right => input_dir = Some( (1, 0) ),
 
-            VirtualKeyCode::Numpad8 => self.directional_callback.unwrap()(self, 0, -1),
-            VirtualKeyCode::Numpad2 => self.directional_callback.unwrap()(self, 0, 1),
-            VirtualKeyCode::Numpad4 => self.directional_callback.unwrap()(self, -1, 0),
-            VirtualKeyCode::Numpad6 => self.directional_callback.unwrap()(self, 1, 0),
+            VirtualKeyCode::Numpad8 => input_dir = Some( (0, -1) ),
+            VirtualKeyCode::Numpad2 => input_dir = Some( (0, 1) ),
+            VirtualKeyCode::Numpad4 => input_dir = Some( (-1, 0) ),
+            VirtualKeyCode::Numpad6 => input_dir = Some( (1, 0) ),
 
-            VirtualKeyCode::Numpad7 => self.directional_callback.unwrap()(self, -1, -1),
-            VirtualKeyCode::Numpad9 => self.directional_callback.unwrap()(self, 1, -1),
-            VirtualKeyCode::Numpad1 => self.directional_callback.unwrap()(self, -1, 1),
-            VirtualKeyCode::Numpad3 => self.directional_callback.unwrap()(self, 1, 1),
+            VirtualKeyCode::Numpad7 => input_dir = Some( (-1, -1) ),
+            VirtualKeyCode::Numpad9 => input_dir = Some( (1, -1) ),
+            VirtualKeyCode::Numpad1 => input_dir = Some( (-1, 1) ),
+            VirtualKeyCode::Numpad3 => input_dir = Some( (1, 1) ),
             _ => {}
         };
+        if input_dir.is_some() {
+            let (dx, dy) = input_dir.unwrap();
+            match self.directional_callback.unwrap() {
+                DirectionalInputTypes::Attack => {
+                    let (px, py) = (
+                        self.get_player().get_x() + dx,
+                        self.get_player().get_y() + dy,
+                    );
+
+                    let dmg = {
+                        let player_stats = self.player_stat_block();
+                        player_stats.atk.get_total()
+                    };
+
+                    let mut found_entity: Option<EntityIndex> = None;
+
+                    for (entity, query) in self.ecs.query::<(&BasicEntity, &mut StatBlock)>()
+                            .iter() {
+                        let (ex, ey) = (query.0.get_x(), query.0.get_y());
+                        if ex == px && ey == py {
+                            //Callback here
+                            //query.1.take_damage(&mut self.ecs, entity, dmg);
+                            found_entity = Some(entity);
+                        }
+                    }
+                    if let Some(found_entity) = found_entity {
+                        let dead = self.ecs.get_mut::<StatBlock>(found_entity).unwrap().take_damage(dmg);
+                        if dead {
+                            self.ecs.insert_one(found_entity, SelfDestructAI { turns_left: 10 });
+
+                            self.ecs.get_mut::<BasicEntity>(found_entity).unwrap().d = Display {
+                                glyph: rltk::to_cp437('%'),
+                                fg: rltk::RED,
+                                bg: rltk::BLACK
+                            };
+                        }
+                    }
+                }
+            }
+            self.directional_callback = None;
+        }
         return true;
     }
 
@@ -413,50 +439,44 @@ impl State {
 
             VirtualKeyCode::Key1 => {
                 self.waiting_for_directional_input = true;
-                self.directional_callback = Some(|state, dx, dy| {
-                    let (px, py) = (
-                        state.get_entity(0).borrow().get_x() + dx,
-                        state.get_entity(0).borrow().get_y() + dy,
-                    );
-                    for entity in state.entities.iter().flatten() {
-                        let (ex, ey) = (entity.borrow().get_x(), entity.borrow().get_y());
-                        if ex == px && ey == py {
-                            //Callback here
-                            let dmg = {
-                                let player_stats = state.stat_blocks[0].as_ref().unwrap().borrow();
-                                player_stats.atk.get_total()
-                            };
-                            let entity_id = entity.borrow().get_id();
-                            match state.stat_blocks[entity_id].as_ref() {
-                                Some(e) => {
-                                    e.borrow_mut()
-                                        .take_damage(state, dmg);
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                });
+                self.directional_callback = Some(DirectionalInputTypes::Attack)
                 *do_tick = false;
             }
-            _ => {}
+            _ => {
+                *do_tick = false;
+            }
         };
     }
 
+    fn player_stat_block(&mut self) -> RefMut<StatBlock> {
+        self.ecs.get_mut::<StatBlock>(self.get_player_id()).unwrap()
+    }
+
+
     fn on_turn(&mut self) {
-        for i in 0..self.entities.len() {
-            let mut ai = std::mem::replace(&mut self.ais.borrow_mut()[i], None);
+        //Copy ids out of query then run the system on them
+        let _zombie_ticks = self.ecs
+            .query::<&ZombieAI>()
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect::<Vec<_>>();
 
-            match ai {
-                Some(ref mut ai) => {
-                    ai.on_turn(self);
-                }
-                None => {}
-            }
+        let _self_destructs = self.ecs
+            .query::<&SelfDestructAI>()
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect::<Vec<_>>();
 
-            //Return the memory
-            let _ = std::mem::replace(&mut self.ais.borrow_mut()[i], ai);
+
+        for e in _zombie_ticks {
+            ZombieAI::on_turn(self, e);
         }
+
+        for e in _self_destructs {
+            SelfDestructAI::on_turn(self, e);
+        }
+
+        PlayerAI::on_turn(self, self.get_player_id());
     }
 
     fn generate_map(width: i32, height: i32) -> Vec<Cell<TileType>> {
@@ -509,7 +529,6 @@ impl State {
 
     fn new() -> State {
         let player = BasicEntity {
-            id: 0,
             x: 1,
             y: 1,
             d: Display {
@@ -521,8 +540,8 @@ impl State {
 
         let f_c_dir = std::env::current_dir().unwrap();
 
-        let rc_load = |s: &'static str| {
-            Rc::new(
+        let arc_load = |s: &'static str| {
+            Arc::new(
                 XpFile::read(
                     &mut File::open(f_c_dir.join(s)).expect(
                         format!(
@@ -539,25 +558,21 @@ impl State {
         let load_map = map_utils::load_from_file("output.map");
 
         let mut state = State {
+            ecs: World::new(),
             map_width: load_map.width,
             map_height: load_map.height,
-            // tiles: State::generate_map(32, 32),
+
             tiles: map_utils::map_to_cells(load_map.tiles),
-            entities: vec![],
-            ais: RefCell::new(vec![]),
-            stat_blocks: vec![],
-            entity_views: vec![],
-            entity_loots: vec![],
+
             resources: vec![
-                rc_load("dude.png.xp"), //0
-                rc_load("firelemental.xp"), //1
-                rc_load("guard.xp"),  //2
-                rc_load("player.xp"), //3
-                rc_load("spider.xp"), //4
-                rc_load("kingspider.xp"), //5
+                arc_load("dude.png.xp"), //0
+                arc_load("firelemental.xp"), //1
+                arc_load("guard.xp"),  //2
+                arc_load("player.xp"), //3
+                arc_load("spider.xp"), //4
+                arc_load("kingspider.xp"), //5
             ],
             queued_destruction: RefCell::new(vec![]),
-            free_slots: vec![],
 
             camera: RefCell::new(Camera::new(-20, -20)),
 
@@ -582,7 +597,6 @@ impl State {
                 serde_json::from_str(&string_buf).unwrap()
             } else {
                 StatBlock {
-                    id: 0,
                     hp: EntityStat::new("Hit Points", 10),
                     def: EntityStat::new("Defense", 3),
                     atk: EntityStat::new("Attack", 5),
@@ -591,16 +605,10 @@ impl State {
             }
         };
 
-        state.add_entity(
-            0,
-            Some(Box::new(RefCell::new(player))),
-            Some(Box::new(PlayerAI)),
-            Some(RefCell::new(player_stat_block)),
-            Some(Rc::new(EntityView {
+        state.ecs.spawn((Player, player, PlayerAI, player_stat_block, EntityView {
                 name: "Me...".to_string(),
                 art: state.resources[3].clone(),
-            })),
-        );
+            }));
 
         Self::load_entities_from_map(&mut state, &load_map.entities);
 
@@ -609,13 +617,6 @@ impl State {
         state
     }
 
-    /* Assumes the entity is initialized will panic if not! */
-    fn get_entity(&self, idx: usize) -> &Box<RefCell<dyn Entity>> {
-        match self.entities[idx] {
-            Some(ref entity) => entity,
-            None => panic!("No entity at index {}", idx),
-        }
-    }
 
     fn set_tile(&mut self, x: i32, y: i32, t: TileType) {
         let idx = self.xy_idx(x, y);
@@ -657,34 +658,59 @@ impl State {
         self.map_height = load_map.height;
 
         self.tiles = map_utils::map_to_cells(load_map.tiles);
-        let mut _entity_0 = std::mem::take(&mut self.entities[0]);
-        _entity_0.as_ref().unwrap().borrow_mut().set_x(x);
-        _entity_0.as_ref().unwrap().borrow_mut().set_y(y);
-        self.entities = vec![_entity_0];
-        {
-            let mut ais_arr = self.ais.borrow_mut();
-            let _ais_0 = std::mem::take(&mut ais_arr[0]);
-            *ais_arr = vec![_ais_0];
-        }
-        let _stat_block_0 = std::mem::take(&mut self.stat_blocks[0]);
-        self.stat_blocks = vec![_stat_block_0];
-        let _entity_view_0 = std::mem::take(&mut self.entity_views[0]);
-        self.entity_views = vec![_entity_view_0];
-        let _entity_loot_0 = std::mem::take(&mut self.entity_loots[0]);
-        self.entity_loots = vec![_entity_loot_0];
 
-        self.free_slots = vec![];
+        let entities_to_drop = self.ecs.query::<Option<&Player>>().iter().map(| (e, plo) | (e.clone(), plo.is_none())).collect::<Vec<_>>();
+
+				for q_d in entities_to_drop {
+            let (e, is_player) = q_d;
+            if is_player {
+                self.ecs.despawn(e).expect("failed to destroy entity");
+            }
+				}
 
         Self::load_entities_from_map(self, &load_map.entities);
 
         self.camera.borrow_mut().update_xy(x, y);
+
+        let mut _p = self.get_player_be();
+        _p.set_x(x);
+        _p.set_y(y);
+        
     }
 
-    fn move_entity_by(&self, entity: EntityIndex, x: i32, y: i32) -> (i32, i32) {
-        let mut entity_r = self.get_entity(entity).borrow_mut();
+    fn get_player_be(&mut self) -> RefMut<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get_mut::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    fn get_player(&self) -> Ref<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    fn get_player_id(&self) -> EntityIndex {
+        self.ecs.query::<&Player>().iter().map(|( e, _ )| e).next().expect("Failed to get player entity.")
+    }
+
+    fn get_entity_comp(&self, me: EntityIndex) -> Ref<'_, BasicEntity> {
+        self.ecs.get::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+    fn get_entity_comp_mut(&mut self, me: EntityIndex) -> RefMut<'_, BasicEntity> {
+        self.ecs.get_mut::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+    fn move_entity_by(&mut self, entity: EntityIndex, x: i32, y: i32) -> (i32, i32) {
+        let entity_r = self.get_entity_comp(entity);
         let new_x = entity_r.get_x() + x;
         let new_y = entity_r.get_y() + y;
         if self.can_move(new_x, new_y) {
+            drop(entity_r);
+            let mut entity_r = self.get_entity_comp_mut(entity);
             entity_r.set_x(new_x);
             entity_r.set_y(new_y);
             return (x, y);
@@ -692,15 +718,17 @@ impl State {
         return (0, 0);
     }
 
-    fn move_player_by(&self, x: i32, y: i32) {
-        let deltas = self.move_entity_by(0, x, y);
+    fn move_player_by(&mut self, x: i32, y: i32) {
+        let deltas = self.move_entity_by(self.get_player_id(), x, y);
         {
             let mut cm = self.camera.borrow_mut();
             cm.dx += deltas.0;
             cm.dy += deltas.1;
         }
-        let plyr = self.get_entity(0).borrow_mut();
-        let (x, y) = (plyr.get_x(), plyr.get_y());
+        let (x, y) = {
+            let plyr = self.get_player_be();
+            (plyr.get_x(), plyr.get_y())
+        };
         let idx_of = self.xy_idx(x, y);
         if let TileType::Portal(_, destination, x, y) = self.tiles[idx_of].get() {
             *self.destination_next_tick.borrow_mut() = Some((destination, x, y));
@@ -732,11 +760,7 @@ impl State {
             }
         }
 
-        for entity in self.entities.iter() {
-            if entity.is_none() {
-                continue;
-            }
-            let entity = entity.as_ref().unwrap().borrow();
+        for entity in self.ecs.query::<&BasicEntity>().iter().map(|( _, p )| p) {
             let (x, y) = (entity.get_x(), entity.get_y());
             if !(l_x..h_x).contains(&x) || !(l_y..h_y).contains(&y) {
                 continue;
@@ -751,7 +775,7 @@ impl State {
 
         //Draw directional arrows around player
         {
-            let player = self.get_entity(0).borrow();
+            let player = self.get_player();
             let (x, y) = (player.get_x(), player.get_y());
             let (x, y) = self.camera.borrow().transform_point((x, y));
 
@@ -779,9 +803,13 @@ impl State {
         }
     }
 
+    fn get_player_stat_block(&self) -> RefMut<StatBlock> {
+        self.ecs.get_mut::<StatBlock>(self.get_player_id()).expect("Failed to get player stat block.")
+    }
+
     fn save_player(&self) {
         let mut file = File::create("player.json").unwrap();
-        let string_buf = serde_json::to_string(&self.stat_blocks[0].unwrap_ref().clone()).unwrap();
+        let string_buf = serde_json::to_string(&*self.get_player_stat_block()).unwrap();
         file.write(string_buf.as_bytes()).expect("Failed to write to player.json");
     }
 }
@@ -823,17 +851,23 @@ impl GameState for State {
 
         //Render Stat info
         {
-            let mut stat_block_to_draw = if !self.currently_viewed_stat_block.is_none() {
-                self.currently_viewed_stat_block.as_ref().unwrap().clone()
+            let e_id = self.currently_viewed_stat_block.unwrap_or(self.get_player_id());
+            let stat_block_to_draw = if !self.currently_viewed_stat_block.is_none() {
+                let fetch_res = self.ecs.get_mut::<StatBlock>(e_id);
+                if fetch_res.is_ok() { fetch_res.unwrap() }
+                else {
+                    self.currently_viewed_stat_block = None;
+                    self.get_player_stat_block()
+                }
             } else {
-                self.stat_blocks[0].unwrap_ref().clone()
+                self.get_player_stat_block()
             };
 
             //Draw the stat block in a TextBlock
 
             let mut tb = TextBuilder::empty();
 
-            if let Some(en_view) = self.entity_views[stat_block_to_draw.id].as_ref() {
+            if let Ok(en_view) = self.ecs.get::<EntityView>(e_id) {
                 en_view.make_text_builder(&mut tb);
             } else {
                 tb.centered("<UNNAMED>").ln();
@@ -849,22 +883,19 @@ impl GameState for State {
 
         if ctx.left_click {
             let (x, y) = ctx.mouse_pos();
-            for entity in self.entities.iter() {
-                if entity.is_none() {
-                    continue;
-                }
-                let entity = entity.as_ref().unwrap().borrow();
+            for (e_id, entity) in self.ecs.query::<&BasicEntity>().iter() {
                 let (ex, ey) = (entity.get_x(), entity.get_y());
                 let (ex, ey) = self.camera.borrow().transform_point((ex, ey));
                 if ex == x && ey == y {
-                    let view = self.entity_views[entity.get_id()].as_ref();
-                    let stat_bl = self.stat_blocks[entity.get_id()].as_ref();
-                    if let Some(view_inner) = view {
-                        self.currently_viewed_art = Some(view_inner.clone());
+                    let view = self.ecs.get::<EntityView>(e_id);
+                    let stat_bl = self.ecs.get::<StatBlock>(e_id);
+
+                    if let Ok(_) = view {
+                        self.currently_viewed_art = Some(e_id);
                     }
 
-                    if let Some(stat_block) = stat_bl {
-                        self.currently_viewed_stat_block = Some(stat_block.borrow().clone());
+                    if let Ok(_) = stat_bl {
+                        self.currently_viewed_stat_block = Some(e_id);
                     }
                 }
             }
@@ -902,19 +933,18 @@ impl GameState for State {
 
         rltk::render_draw_buffer(ctx).expect("Rendering error");
 
-        if let Some(ref c_view_art) = self.currently_viewed_art {
-            self.print_image_at(41, 20, c_view_art, ctx)
-        } else {
-            let player_art = self.entity_views[0].as_ref().unwrap();
-            self.print_image_at(41, 20, player_art, ctx)
-        };
+        let player_art = self
+            .ecs
+            .query::<(&Player, &EntityView)>()
+            .iter().map(|(a, (b, c))| { c }).next().unwrap();
 
-        //Clean up the queued disposed objects
-        let qudesc = self.queued_destruction.replace(Vec::new());
-        for indx in qudesc {
-            self.dispose_slot(indx);
+        let c_view_art = self.ecs.get::<EntityView>(self.currently_viewed_art.unwrap_or(self.get_player_id()));
+        if c_view_art.is_err() {
+            self.currently_viewed_art = None;
         }
+        self.print_image_at(41, 20, &c_view_art.unwrap_or(self.get_player_view()), ctx);
     }
+
 }
 
 fn main() -> BResult<()> {

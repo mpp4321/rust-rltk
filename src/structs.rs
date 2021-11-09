@@ -2,8 +2,10 @@ use crate::{EntityIndex, State, math_utils};
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::{max, min};
-use std::rc::Rc;
+use std::f32::consts::SQRT_2;
+use std::sync::Arc;
 
+use hecs::World;
 use rltk::{RGB, TextBuilder, XpFile};
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +37,14 @@ pub mod map_utils {
         tiles.into_iter().map(|tile| Cell::new(tile)).collect()
     }
 }
+
+#[derive(Copy, Clone)]
+pub enum DirectionalInputTypes {
+    Attack
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Player;
 
 #[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct EntityStat {
@@ -111,55 +121,37 @@ impl Display {
     }
 }
 
-pub trait EntityAI {
-    fn get_id(&self) -> EntityIndex;
-
-    fn on_turn(&mut self, state: &State);
-    fn on_remove(&mut self, state: &State);
-    fn on_death(&mut self, state: &State);
-}
-
-//Just things that every entity has and needs for rendering
-pub trait Entity {
-    fn get_id(&self) -> EntityIndex;
-
-    fn get_x(&self) -> i32;
-    fn get_y(&self) -> i32;
-    fn get_display(&self) -> Display;
-
-    fn set_x(&mut self, x: i32);
-    fn set_y(&mut self, y: i32);
-
-    fn set_display(&mut self, display: Display);
-
-    fn move_by(&mut self, _dx: i32, _dy: i32);
-}
+// pub trait Entity {
+//     fn get_x(&self) -> i32;
+//     fn get_y(&self) -> i32;
+//     fn get_display(&self) -> Display;
+//
+//     fn set_x(&mut self, x: i32);
+//     fn set_y(&mut self, y: i32);
+//
+//     fn set_display(&mut self, display: Display);
+//
+//     fn move_by(&mut self, _dx: i32, _dy: i32);
+// }
 
 pub struct SelfDestructAI {
-    id: EntityIndex,
-    turns_left: i32,
+    pub turns_left: i32,
 }
 
-impl EntityAI for SelfDestructAI {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+impl SelfDestructAI {
 
-    fn on_turn(&mut self, state: &State) {
-        self.turns_left -= 1;
-        if self.turns_left < 0 {
-            state.queue_destruction(self.get_id());
+    pub fn on_turn(state: &mut State, me: EntityIndex) {
+        let mut sd_ai = state.ecs.get_mut::<SelfDestructAI>(me).unwrap();
+        sd_ai.turns_left -= 1;
+        if sd_ai.turns_left < 0 {
+            drop(sd_ai);
+            state.ecs.despawn(me).expect("Failed to despawn an entity");
         }
     }
 
-    fn on_remove(&mut self, _state: &State) {}
-
-    fn on_death(&mut self, _state: &State) {}
 }
 
 pub struct BasicEntity {
-    pub id: EntityIndex,
-
     pub x: i32,
     pub y: i32,
     pub d: Display,
@@ -168,8 +160,6 @@ pub struct BasicEntity {
 //Entities with stat blocks and complex interactions etc
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatBlock {
-    pub id: EntityIndex,
-
     pub def: EntityStat,
     pub atk: EntityStat,
     pub hp: EntityStat,
@@ -180,7 +170,6 @@ pub struct StatBlock {
 impl Default for StatBlock {
     fn default() -> Self {
         StatBlock {
-            id: 0,
             atk: EntityStat::new("Attack", 0),
             def: EntityStat::new("Defense", 0),
             hp: EntityStat::new("Hit Points", 0),
@@ -190,9 +179,6 @@ impl Default for StatBlock {
 }
 
 impl StatBlock {
-    pub fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
 
     pub fn make_text_builder(&self, builder: &mut TextBuilder) {
         builder
@@ -203,51 +189,16 @@ impl StatBlock {
             .append(format!("DEF: {}", self.def.get_total()).as_str());
     }
 
-    pub fn take_damage(&mut self, state: &State, damage: i32) -> bool {
+    pub fn take_damage(&mut self, damage: i32) -> bool {
         self.hp.decrement(max(0, damage - self.def.get_total()) );
 
         if self.hp.get_total() <= 0 && !self.dead {
             self.dead = true;
-            state.ais.borrow_mut()[self.id] = Some(Box::new(SelfDestructAI { id: self.get_id(), turns_left: 5 }));
-            state.get_entity(self.id).borrow_mut().set_display(Display {
-                glyph: rltk::to_cp437('%'),
-                fg: rltk::RED,
-                bg: rltk::BLACK
-            });
-
-            if state.entity_loots[self.id].is_some() {
-                let mut e_loot = state.entity_loots[self.id].as_ref().unwrap().borrow_mut();
-                e_loot.handle_loot(state);
-            }
-
             return true;
         }
 
         return false;
     }
-}
-
-pub struct ZombieAI {
-    pub id: EntityIndex,
-}
-
-pub struct PlayerAI;
-
-impl EntityAI for PlayerAI {
-    fn get_id(&self) -> EntityIndex {
-        return 0;
-    }
-
-    fn on_turn(&mut self, state: &State) {
-        if math_utils::chance(0.3) {
-            // Get the player's stat block
-            let mut player_stats = state.stat_blocks[0].unwrap_ref_mut();
-            player_stats.hp.increment(1);
-        }
-    }
-
-    fn on_remove(&mut self, _: &State) {}
-    fn on_death(&mut self, _: &State) {}
 }
 
 pub trait MyOptionTimeSaver<T> {
@@ -267,82 +218,83 @@ impl<T> MyOptionTimeSaver<T> for Option<RefCell<T>> {
 
 }
 
-impl EntityAI for ZombieAI {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+#[derive(Clone, Copy)]
+pub struct ZombieAI;
 
-    fn on_turn(&mut self, state: &State) {
-        let me = self.get_id();
-        if math_utils::chance(0.5) {
-            return;
-        }
+impl ZombieAI {
 
-        let player_pos = (
-            state.get_entity(0).borrow().get_x(),
-            state.get_entity(0).borrow().get_y(),
-        );
-        let mut me = state.get_entity(me).borrow_mut();
-        let zombie_pos = (me.get_x(), me.get_y());
-        //Calculate the direction to the player from zombie_pos
-        let dx = player_pos.0 - zombie_pos.0;
-        let dy = player_pos.1 - zombie_pos.1;
-        //Calculate the distance as float
-        let distance = (((dx * dx) + (dy * dy)) as f32).sqrt();
-        if distance > 3.0 {
-            return;
-        }
-        //Normalize dx, dy
+    pub fn on_turn(state: &mut State, me: EntityIndex) {
+        //let be = ecs.get::<BasicEntity>(e).unwrap();
+        let plr_pos = state.get_player();
+        let be_comp = state.ecs.get_mut::<BasicEntity>(me).unwrap();
+
+        let dx = plr_pos.get_x() - be_comp.get_x();
+        let dy = plr_pos.get_y() - be_comp.get_y();
+
+        let dist = ((dx * dx + dy * dy) as f32).sqrt();
 
         let dx = dx / max(1, dx.abs());
         let dy = dy / max(1, dy.abs());
 
-        const SQRT_2DIST: f32 = 0.01 + std::f64::consts::SQRT_2 as f32;
-        if distance < SQRT_2DIST {
-            state.stat_blocks[0]
-                .unwrap_ref_mut()
-                .take_damage(state, state.stat_blocks[me.get_id()].unwrap_ref().atk.get_total());
-        } else if state.can_move(me.get_x() + dx, me.get_y() + dy) {
-            me.move_by(dx, dy);
+        let me_stats = state.ecs.get_mut::<StatBlock>(me).unwrap();
+
+        if me_stats.dead { return; }
+
+        if dist - 0.01_f32 < SQRT_2 {
+            // Attack here
+            let mut plr_stats = state.get_player_stat_block();
+            plr_stats.take_damage(me_stats.atk.get_total());
+        } else if dist < 5.0 && math_utils::chance(0.9) {
+            // Move here
+            drop(be_comp);
+            drop(plr_pos);
+            drop(me_stats);
+            state.move_entity_by(me, dx, dy);
         }
     }
-    fn on_remove(&mut self, _: &State) {}
-    fn on_death(&mut self, _: &State) {}
+
 }
 
-impl Entity for BasicEntity {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+pub struct PlayerAI;
 
-    fn get_x(&self) -> i32 {
+impl PlayerAI {
+    pub fn on_turn(state: &mut State, e: EntityIndex) {
+        let st_bl = &mut *state.ecs.get_mut::<StatBlock>(e).unwrap();
+        st_bl.hp.increment(1);
+    }
+}
+
+impl BasicEntity {
+
+    pub fn get_x(&self) -> i32 {
         self.x
     }
 
-    fn get_y(&self) -> i32 {
+    pub fn get_y(&self) -> i32 {
         self.y
     }
 
-    fn get_display(&self) -> Display {
+    pub fn get_display(&self) -> Display {
         self.d
     }
 
-    fn set_x(&mut self, x: i32) {
+    pub fn set_x(&mut self, x: i32) {
         self.x = x;
     }
 
-    fn set_y(&mut self, y: i32) {
+    pub fn set_y(&mut self, y: i32) {
         self.y = y;
     }
 
-    fn set_display(&mut self, display: Display) {
+    pub fn set_display(&mut self, display: Display) {
         self.d = display;
     }
 
-    fn move_by(&mut self, dx: i32, dy: i32) {
+    pub fn move_by(&mut self, dx: i32, dy: i32) {
         self.x += dx;
         self.y += dy;
     }
+
 }
 
 pub struct Camera {
@@ -431,7 +383,7 @@ impl Camera {
 
 pub struct EntityView {
     pub name: String,
-    pub art: Rc<XpFile>,
+    pub art: Arc<XpFile>,
 }
 
 impl EntityView {
@@ -439,38 +391,34 @@ impl EntityView {
         builder.centered(self.name.as_str()).ln();
     }
 }
+
 pub trait EntityLootHandler {
-    fn get_id(&self) -> EntityIndex;
     fn handle_loot(&mut self, state: &crate::State);
 }
 
 pub struct SpiderLoot { pub id: EntityIndex, pub max_atk: i32}
 
 impl EntityLootHandler for SpiderLoot {
-    fn get_id(&self) -> EntityIndex {
-        self.id
-    }
-
     fn handle_loot(&mut self, state: &crate::State) {
-        if math_utils::chance(0.3) {
-            //Improve player's atk up to 5
-            let mut player_stats = state
-                .stat_blocks[0]
-                .unwrap_ref_mut();
-
-            let hp_cur_max = player_stats.hp.get_max();
-            if hp_cur_max < 30 {
-                player_stats.hp.set_max(
-                    hp_cur_max + 1
-                );
-            }
-
-            let atk_cur_max = player_stats.atk.get_max();
-            if atk_cur_max < self.max_atk {
-                player_stats.atk.set(
-                    atk_cur_max + 1
-                );
-            }
-        }
+        // if math_utils::chance(0.3) {
+        //     //Improve player's atk up to 5
+        //     let mut player_stats = state
+        //         .stat_blocks[0]
+        //         .unwrap_ref_mut();
+        //
+        //     let hp_cur_max = player_stats.hp.get_max();
+        //     if hp_cur_max < 30 {
+        //         player_stats.hp.set_max(
+        //             hp_cur_max + 1
+        //         );
+        //     }
+        //
+        //     let atk_cur_max = player_stats.atk.get_max();
+        //     if atk_cur_max < self.max_atk {
+        //         player_stats.atk.set(
+        //             atk_cur_max + 1
+        //         );
+        //     }
+        // }
     }
 }
