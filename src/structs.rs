@@ -6,7 +6,7 @@ use std::f32::consts::SQRT_2;
 use std::sync::Arc;
 
 use hecs::World;
-use rltk::{RGB, TextBuilder, XpFile};
+use rltk::{DrawBatch, Point, RGB, Rltk, TextBuilder, VirtualKeyCode, XpFile};
 use serde::{Deserialize, Serialize};
 
 pub mod map_utils {
@@ -142,7 +142,9 @@ impl SelfDestructAI {
 
     pub fn on_turn(state: &mut State, me: EntityIndex) {
         let mut sd_ai = state.ecs.get_mut::<SelfDestructAI>(me).unwrap();
+
         sd_ai.turns_left -= 1;
+        
         if sd_ai.turns_left < 0 {
             drop(sd_ai);
             state.ecs.despawn(me).expect("Failed to despawn an entity");
@@ -422,3 +424,246 @@ impl EntityLootHandler for SpiderLoot {
         // }
     }
 }
+
+#[derive(Clone)]
+pub enum EffectChain {
+    DamageTarget(Option<Box<EffectChain>>, i32),
+    HealTarget(Option<Box<EffectChain>>, i32),
+    HealUser(Option<Box<EffectChain>>, i32),
+}
+
+impl EffectChain {
+
+    pub fn handle_chain_target(&self, user: Option<EntityIndex>, target: Option<EntityIndex>, state: &mut State) {
+        match self {
+            EffectChain::DamageTarget(chain, amt) => {
+                if let Some(target) = target {
+                    state.ecs.get_mut::<StatBlock>(target).unwrap().hp.decrement(*amt);
+                }
+            }
+            _ => {}
+        }
+    }
+
+}
+
+pub struct Item {
+    pub name: String,
+    pub art: Arc<XpFile>,
+    pub effect_chain: Option<EffectChain>,
+}
+
+pub struct Container {
+    pub items: Vec<Item>,
+    pub max_items: usize,
+}
+
+impl Container {
+    pub fn try_add_item(&mut self, item: Item) -> Option<Item> {
+        let max_items = self.max_items;
+        let items = &mut self.items;
+        if items.len() >= max_items {
+            return Some(item);
+        }
+        items.push(item);
+        None
+    }
+}
+
+pub struct Equipment {
+    pub equips: Vec<Option<usize>>,
+    pub max_equips: usize,
+}
+
+impl Equipment {
+    pub fn new() -> Self {
+        Equipment {
+            equips:vec![None; 3],
+            max_equips: 3
+        }
+    }
+}
+
+pub trait UInterface {
+    fn on_input(&self, state: &mut State, key: Option<VirtualKeyCode>) -> bool;
+    fn render(&self, ctx: &mut Rltk, state: &State);
+}
+
+pub struct InventoryUI {
+    pub container_id: EntityIndex,
+    pub pending_item: RefCell<Option<usize>>,
+}
+
+impl InventoryUI {
+    // The general function for handling input for the inventory UI
+    fn select_item(&self, state: &mut State, item: usize) {
+        if self.pending_item.borrow().is_some() {
+            let slot = self.pending_item.borrow().unwrap();
+            self.equip_item(state, slot, item);
+            // gotta see if it changed because of equip_item
+            let slot = self.pending_item.borrow();
+            if slot.is_none() { return; }
+            if slot.unwrap() == item {
+                //Gotta drop slot here cus it's borrowing pending_items already
+                drop(slot);
+                self.pending_item.replace(None);
+                return;
+            }
+            return;
+        }
+        self.pending_item.borrow_mut().replace(item);
+    }
+
+    // Equips item from slot into item slot of equipment
+    fn equip_item(&self, state: &mut State, slot: usize, item: usize) {
+        let mut player_equips = state.ecs.get_mut::<Equipment>(state.get_player_id()).unwrap();
+        if let Some(Some(in_slot)) = player_equips.equips.get(item) {
+            if *in_slot == slot {
+                player_equips.equips[item] = None;
+                return;
+            }
+        }
+        player_equips.equips[item] = Some(slot);
+        self.pending_item.replace(None);
+    }
+}
+
+pub const fn enumerate_key_displays() -> [char; 32] {
+    return [
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+        '8',
+        '9',
+        '0',
+        'a',
+        'b',
+        'c',
+        'd',
+        'e',
+        'f',
+        'g',
+        'h',
+        'i',
+        'j',
+        'k',
+        'l',
+        'm',
+        'n',
+        'o',
+        'p',
+        'q',
+        'r',
+        's',
+        't',
+        'u',
+        'v',
+    ];
+}
+
+pub const fn enumerate_keys() -> [VirtualKeyCode; 32] {
+    return [
+        VirtualKeyCode::Key1,
+        VirtualKeyCode::Key2,
+        VirtualKeyCode::Key3,
+        VirtualKeyCode::Key4,
+        VirtualKeyCode::Key5,
+        VirtualKeyCode::Key6,
+        VirtualKeyCode::Key7,
+        VirtualKeyCode::Key8,
+        VirtualKeyCode::Key9,
+        VirtualKeyCode::Key0,
+        VirtualKeyCode::A,
+        VirtualKeyCode::B,
+        VirtualKeyCode::C,
+        VirtualKeyCode::D,
+        VirtualKeyCode::E,
+        VirtualKeyCode::F,
+        VirtualKeyCode::G,
+        VirtualKeyCode::H,
+        VirtualKeyCode::I,
+        VirtualKeyCode::J,
+        VirtualKeyCode::K,
+        VirtualKeyCode::L,
+        VirtualKeyCode::M,
+        VirtualKeyCode::N,
+        VirtualKeyCode::O,
+        VirtualKeyCode::P,
+        VirtualKeyCode::Q,
+        VirtualKeyCode::R,
+        VirtualKeyCode::S,
+        VirtualKeyCode::T,
+        VirtualKeyCode::U,
+        VirtualKeyCode::V,
+    ];
+}
+
+pub fn get_index_from_key(key: VirtualKeyCode) -> Option<usize> {
+    const KEY_OPTIONS: [VirtualKeyCode; 32] = enumerate_keys();
+
+    if KEY_OPTIONS.contains(&key) {
+        for (i, k) in KEY_OPTIONS.iter().enumerate() {
+            if key == *k {
+                return Some(i);
+            }
+        }
+    }
+    return None;
+}
+
+impl UInterface for InventoryUI {
+    fn on_input(&self, state: &mut State, key: Option<VirtualKeyCode>) -> bool {
+        if key.is_none() { return false; }
+        const KEY_OPTIONS: [VirtualKeyCode; 32] = enumerate_keys();
+        let key = key.unwrap();
+
+        if KEY_OPTIONS.contains(&key) {
+            for (i, k) in KEY_OPTIONS.iter().enumerate() {
+                if key == *k {
+                    self.select_item(state, i);
+                }
+            }
+        }
+
+        if key == VirtualKeyCode::Escape {
+            return true;
+        }
+        return false;
+    }
+    
+    fn render(&self, ctx: &mut Rltk, state: &State) {
+        let mut g_db = DrawBatch::new();
+        g_db.cls();
+        
+        const KEY_OPTIONS: [char; 32] = enumerate_key_displays();
+
+        if let Ok(container) = state.ecs.get::<Container>(self.container_id) {
+            for (i, item) in container.items.iter().enumerate() {
+                if i >= KEY_OPTIONS.len() { break; }
+                g_db.print(Point::new(0, i), format!("{}: {}", KEY_OPTIONS[i], item.name).as_str());
+            }
+
+            if let Some(pi) = *self.pending_item.borrow() {
+                if let Ok(equipment) = state.ecs.get::<Equipment>(self.container_id) {
+                    for (i, item) in equipment.equips.iter().enumerate() {
+                        if i >= KEY_OPTIONS.len() { break; }
+                        let item_name = if item.is_some() { container.items[item.unwrap()].name.as_str() } else { "Empty" };
+                        g_db.print(Point::new(16, i), format!("{}: {}", KEY_OPTIONS[i], item_name).as_str());
+                    }
+                }
+            }
+        }
+
+        g_db.submit(0).expect("Rendering error with draw batch");
+
+        rltk::render_draw_buffer(ctx).expect("Rendering error");
+    }
+
+}
+
+
+

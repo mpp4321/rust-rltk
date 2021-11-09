@@ -12,7 +12,6 @@ use structs::map_utils::MapDescriptor;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
-use std::ops::DerefMut;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -324,7 +323,7 @@ pub struct State {
     camera: RefCell<Camera>,
 
     waiting_for_directional_input: bool,
-    directional_callback: Option<DirectionalInputTypes>,
+    directional_callback: Option<usize>,
 
     currently_viewed_art: Option<EntityIndex>,
     currently_viewed_stat_block: Option<EntityIndex>,
@@ -332,10 +331,17 @@ pub struct State {
     until_player_save: f32,
 
     portal_locations: Vec<&'static str>,
-    destination_next_tick: RefCell<Option<(usize, i32, i32)>>
+    destination_next_tick: RefCell<Option<(usize, i32, i32)>>,
+
+    open_window: Option<Box<dyn UInterface>>,
 }
 
 impl State {
+
+    pub fn close_open_window(&mut self) {
+        self.open_window = None;
+    }
+
     pub fn print_image_at(&self, x: i32, y: i32, entity_view: &EntityView, ctx: &mut Rltk) {
         ctx.render_xp_sprite(&entity_view.art, x, y);
     }
@@ -380,49 +386,53 @@ impl State {
         };
         if input_dir.is_some() {
             let (dx, dy) = input_dir.unwrap();
-            match self.directional_callback.unwrap() {
-                DirectionalInputTypes::Attack => {
-                    let (px, py) = (
-                        self.get_player().get_x() + dx,
-                        self.get_player().get_y() + dy,
-                    );
+            if let Some(slot) = self.directional_callback {
+                let (px, py) = (
+                    self.get_player().get_x() + dx,
+                    self.get_player().get_y() + dy,
+                );
 
-                    let dmg = {
-                        let player_stats = self.player_stat_block();
-                        player_stats.atk.get_total()
-                    };
+                let mut found_entity: Option<EntityIndex> = None;
 
-                    let mut found_entity: Option<EntityIndex> = None;
-
-                    for (entity, query) in self.ecs.query::<(&BasicEntity, &mut StatBlock)>()
-                            .iter() {
-                        let (ex, ey) = (query.0.get_x(), query.0.get_y());
-                        if ex == px && ey == py {
-                            //Callback here
-                            //query.1.take_damage(&mut self.ecs, entity, dmg);
-                            found_entity = Some(entity);
-                        }
+                for (entity, query) in self.ecs.query::<(&BasicEntity, &mut StatBlock)>()
+                        .iter() {
+                    let (ex, ey) = (query.0.get_x(), query.0.get_y());
+                    if ex == px && ey == py {
+                        found_entity = Some(entity);
                     }
-                    if let Some(found_entity) = found_entity {
-                        let dead = self.ecs.get_mut::<StatBlock>(found_entity).unwrap().take_damage(dmg);
-                        if dead {
-                            self.ecs.insert_one(found_entity, SelfDestructAI { turns_left: 10 });
+                }
 
-                            self.ecs.get_mut::<BasicEntity>(found_entity).unwrap().d = Display {
-                                glyph: rltk::to_cp437('%'),
-                                fg: rltk::RED,
-                                bg: rltk::BLACK
-                            };
-                        }
-                    }
+                let player_id = self.get_player_id();
+
+                let eff_chain: Option<EffectChain> = { 
+                    let player_equips = self.ecs.get::<Equipment>(player_id).unwrap();
+                    let player_container = self.ecs.get::<Container>(player_id).unwrap();
+
+                    player_equips.equips
+                        .get(slot)
+                        .and_then(|x| x.and_then(|x| player_container.items.get(x)))
+                        .and_then(|a| a.effect_chain.as_ref().and_then(|z| Some(z.clone())))
+                };
+
+                if let Some(eff_chain) = eff_chain {
+                    eff_chain.handle_chain_target(Some(player_id), found_entity, self);
                 }
             }
             self.directional_callback = None;
         }
+
         return true;
     }
 
     fn handle_movement_input(&mut self, key: VirtualKeyCode, do_tick: &mut bool) {
+
+        if enumerate_keys().contains(&key) {
+            self.waiting_for_directional_input = true;
+            *do_tick = false;
+            self.directional_callback = Some(get_index_from_key(key).expect("This should never run."));
+            return;
+        }
+
         match key {
             VirtualKeyCode::S => self.save_player(),
 
@@ -440,12 +450,6 @@ impl State {
             VirtualKeyCode::Numpad9 => self.move_player_by(1, -1),
             VirtualKeyCode::Numpad1 => self.move_player_by(-1, 1),
             VirtualKeyCode::Numpad3 => self.move_player_by(1, 1),
-
-            VirtualKeyCode::Key1 => {
-                self.waiting_for_directional_input = true;
-                self.directional_callback = Some(DirectionalInputTypes::Attack);
-                *do_tick = false;
-            }
             _ => {
                 *do_tick = false;
             }
@@ -481,6 +485,28 @@ impl State {
         }
 
         PlayerAI::on_turn(self, self.get_player_id());
+
+        let _dead_entities = self.ecs.query::<&StatBlock>().into_iter().filter(|( e, z )| {
+            z.hp.get_total() <= 0
+        }).map(|(e, z)| e).collect::<Vec<_>>();
+
+        // handle deaths
+        for e in _dead_entities {
+            if self.ecs.get::<StatBlock>(e).unwrap().dead { return; }
+
+            self.ecs.get_mut::<StatBlock>(e).unwrap().dead = true;
+
+            self.ecs.insert_one(e, SelfDestructAI { turns_left: 10 }).expect("Failed to insert self destruct ai");
+
+            self.ecs.get_mut::<BasicEntity>(e).unwrap().d = Display {
+                glyph: rltk::to_cp437('%'),
+                fg: rltk::RED,
+                bg: rltk::BLACK
+            };
+
+        }
+
+
     }
 
     fn generate_map(width: i32, height: i32) -> Vec<Cell<TileType>> {
@@ -595,6 +621,7 @@ impl State {
                 "portal_land.map"
             ],
             destination_next_tick: RefCell::new(None),
+            open_window: None,
         };
 
         let player_stat_block: StatBlock = {
@@ -613,7 +640,20 @@ impl State {
             }
         };
 
-        state.ecs.spawn((Player, player, PlayerAI, player_stat_block, EntityView {
+        state.ecs.spawn((
+        Container {
+            items: vec![Item {
+                name: "Rusty Sword".to_string(),
+                art: state.resources[0].clone(),
+                effect_chain: Some(EffectChain::DamageTarget(None, 5)),
+            }],
+            max_items: 999,
+        }, 
+        Equipment {
+            equips: vec![None, None, None],
+            max_equips: 3,
+        },
+        Player, player, PlayerAI, player_stat_block, EntityView {
                 name: "Me...".to_string(),
                 art: state.resources[3].clone(),
             }));
@@ -820,11 +860,8 @@ impl State {
         let string_buf = serde_json::to_string(&*self.get_player_stat_block()).unwrap();
         file.write(string_buf.as_bytes()).expect("Failed to write to player.json");
     }
-}
 
-impl GameState for State {
-    fn tick(&mut self, ctx: &mut Rltk) {
-
+    fn update(&mut self, ctx: &mut Rltk) {
         let destination_tick_info = {
             if let Some((destination, x, y)) = *self.destination_next_tick.borrow_mut() {
                 Some((destination, x, y))
@@ -837,9 +874,6 @@ impl GameState for State {
             self.load_map_by_destination(destination, x, y)
         }
 
-        let mut g_db = DrawBatch::new();
-        g_db.cls();
-
         self.camera.borrow_mut().tween_tick(ctx.frame_time_ms);
 
         self.until_player_save -= ctx.frame_time_ms / 1000.0;
@@ -847,6 +881,11 @@ impl GameState for State {
             self.until_player_save = 30.0;
             self.save_player();
         }
+    }
+
+    fn render_game_window(&mut self, ctx: &mut Rltk) {
+        let mut g_db = DrawBatch::new();
+        g_db.cls();
 
         // Draw a line down x = 41 of |
         for y in 0..50 {
@@ -927,6 +966,12 @@ impl GameState for State {
                     self.handle_directional_input(key);
                     self.waiting_for_directional_input = false;
                 } else {
+                    if key == VirtualKeyCode::I {
+                        self.open_window = Some(Box::new(InventoryUI {
+                            container_id: self.get_player_id(),
+                            pending_item: RefCell::new(None)
+                        }));
+                    }
                     self.handle_movement_input(key, &mut do_tick);
                 }
                 if do_tick {
@@ -951,6 +996,27 @@ impl GameState for State {
             self.currently_viewed_art = None;
         }
         self.print_image_at(41, 20, &c_view_art.unwrap_or(self.get_player_view()), ctx);
+    }
+
+}
+
+impl GameState for State {
+    fn tick(&mut self, ctx: &mut Rltk) {
+        if self.open_window.is_some() {
+            let bo_w = std::mem::take(&mut self.open_window);
+
+            let close = bo_w.as_ref()
+                .unwrap()
+                .on_input(self, ctx.key);
+
+            bo_w.as_ref().unwrap().render(ctx, self);
+            if !close {
+                let _ = std::mem::replace(&mut self.open_window, bo_w);
+            }
+        } else {
+            self.update(ctx);
+            self.render_game_window(ctx);
+        }
     }
 
 }
