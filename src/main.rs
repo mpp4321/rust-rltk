@@ -10,6 +10,7 @@ use structs::*;
 use serde::{Deserialize, Serialize};
 use structs::map_utils::MapDescriptor;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::Path;
@@ -304,21 +305,11 @@ impl GameState for MapEditorState {
 // Main game state
 pub struct State {
 
-    ecs: World,
+    ecs: EntityWorld,
 
-    // entities: Vec<Option<Box<RefCell<dyn Entity>>>>,
-    // ais: RefCell<Vec<Option<Box<dyn EntityAI>>>>,
-    // stat_blocks: Vec<Option<RefCell<StatBlock>>>,
-    // entity_views: Vec<Option<Rc<EntityView>>>,
     resources: Vec<Arc<XpFile>>,
-    // entity_loots: Vec<Option<Box<RefCell<dyn EntityLootHandler>>>>,
 
     queued_destruction: RefCell<Vec<EntityIndex>>,
-
-    map_width: i32,
-    map_height: i32,
-
-    tiles: Vec<Cell<TileType>>,
 
     camera: RefCell<Camera>,
 
@@ -330,10 +321,12 @@ pub struct State {
 
     until_player_save: f32,
 
-    portal_locations: Vec<&'static str>,
     destination_next_tick: RefCell<Option<(usize, i32, i32)>>,
 
     open_window: Option<Box<dyn UInterface>>,
+    
+    map_state: InternalMapState,
+
 }
 
 impl State {
@@ -344,10 +337,6 @@ impl State {
 
     pub fn print_image_at(&self, x: i32, y: i32, entity_view: &EntityView, ctx: &mut Rltk) {
         ctx.render_xp_sprite(&entity_view.art, x, y);
-    }
-
-    fn get_player_view(&self) -> Ref<EntityView> {
-        self.ecs.get::<EntityView>(self.get_player_id()).expect("Failed to get player view.")
     }
 
     pub fn queue_destruction(&self, slot: EntityIndex) {
@@ -388,8 +377,8 @@ impl State {
             let (dx, dy) = input_dir.unwrap();
             if let Some(slot) = self.directional_callback {
                 let (px, py) = (
-                    self.get_player().get_x() + dx,
-                    self.get_player().get_y() + dy,
+                    self.ecs.get_player().get_x() + dx,
+                    self.ecs.get_player().get_y() + dy,
                 );
 
                 let mut found_entity: Option<EntityIndex> = None;
@@ -402,20 +391,27 @@ impl State {
                     }
                 }
 
-                let player_id = self.get_player_id();
+                let player_id = self.ecs.get_player_id();
 
-                let eff_chain: Option<EffectChain> = { 
+                let player_container = self.ecs.get::<Container>(player_id).unwrap();
+
+                let eff_chain_valid = { 
                     let player_equips = self.ecs.get::<Equipment>(player_id).unwrap();
-                    let player_container = self.ecs.get::<Container>(player_id).unwrap();
 
                     player_equips.equips
                         .get(slot)
-                        .and_then(|x| x.and_then(|x| player_container.items.get(x)))
-                        .and_then(|a| a.effect_chain.as_ref().and_then(|z| Some(z.clone())))
+                        .and_then(|x|
+                            x.and_then(|x| if player_container.items.get(x).is_some() { Some(x) } else { None } )
+                        )
+                        //.and_then(|a| a.effect_chain.as_ref().and_then(|z| Some(z)))
                 };
 
-                if let Some(eff_chain) = eff_chain {
-                    eff_chain.handle_chain_target(Some(player_id), found_entity, self);
+                if let Some(eff_chain_idx) = eff_chain_valid {
+                    let item_ref = player_container.items.get(eff_chain_idx).unwrap();
+                    if let Some(eff_chain) = item_ref.effect_chain.clone().as_ref() {
+                        drop(player_container);
+                        eff_chain.handle_effect(&mut self.ecs, player_id, found_entity.iter().map(|z| *z).collect());
+                    }
                 }
             }
             self.directional_callback = None;
@@ -456,11 +452,6 @@ impl State {
         };
     }
 
-    fn player_stat_block(&mut self) -> RefMut<StatBlock> {
-        self.ecs.get_mut::<StatBlock>(self.get_player_id()).unwrap()
-    }
-
-
     fn on_turn(&mut self) {
         //Copy ids out of query then run the system on them
         let _zombie_ticks = self.ecs
@@ -484,11 +475,11 @@ impl State {
             SelfDestructAI::on_turn(self, e);
         }
 
-        PlayerAI::on_turn(self, self.get_player_id());
+        PlayerAI::on_turn(self, self.ecs.get_player_id());
 
-        let _dead_entities = self.ecs.query::<&StatBlock>().into_iter().filter(|( e, z )| {
+        let _dead_entities = self.ecs.query::<&StatBlock>().into_iter().filter(|( _, z )| {
             z.hp.get_total() <= 0
-        }).map(|(e, z)| e).collect::<Vec<_>>();
+        }).map(|(e, _)| e).collect::<Vec<_>>();
 
         // handle deaths
         for e in _dead_entities {
@@ -509,6 +500,7 @@ impl State {
 
     }
 
+    #[allow(dead_code)]
     fn generate_map(width: i32, height: i32) -> Vec<Cell<TileType>> {
         let mut map = vec![];
         for _ in 0..width * height {
@@ -529,13 +521,14 @@ impl State {
         map
     }
 
+    #[allow(dead_code)]
     fn generate_entities(&mut self) {
-        for _ in 0..(self.map_width * self.map_height) {
+        for _ in 0..(self.map_width() * self.map_height()) {
             if !math_utils::chance(0.01) {
                 continue;
             }
 
-            let pos = math_utils::random_point(1, self.map_width - 1, 1, self.map_height - 1);
+            let pos = math_utils::random_point(1, self.map_width() - 1, 1, self.map_height() - 1);
 
             if !math_utils::chance(0.3) {
                 entity_create::create_goblin(self, pos);
@@ -546,15 +539,16 @@ impl State {
     }
 
     fn load_entities_from_map(state: &mut State, entities: &Vec<Option<MEEntity>>) {
+        state.map_state.clear_entities();
         for load_entity in entities.iter().enumerate() {
             if !load_entity.1.is_some() {
                 continue;
             }
-            let (x, y) = state.idx_xy(load_entity.0);
+            let (x, y) = state.map_state.idx_xy(load_entity.0);
             let m_entity = load_entity.1.as_ref().unwrap();
-            entity_create::resolve_entity_string(state, (x, y), m_entity.name.as_str());
+            let e_indx = entity_create::resolve_entity_string(state, (x, y), m_entity.name.as_str());
+            state.map_state.strict_add_from_pos((x, y), e_indx);
         }
-
     }
 
     fn new() -> State {
@@ -588,11 +582,19 @@ impl State {
         let load_map = map_utils::load_from_file("main.map");
 
         let mut state = State {
-            ecs: World::new(),
-            map_width: load_map.width,
-            map_height: load_map.height,
+            ecs: EntityWorld { ecs: World::new() },
 
-            tiles: map_utils::map_to_cells(load_map.tiles),
+            map_state: InternalMapState {
+                map_width: load_map.width,
+                map_height: load_map.height,
+
+                tiles: map_utils::map_to_cells(load_map.tiles),
+                portal_locations: vec![
+                    "main.map",
+                    "portal_land.map"
+                ],
+                entities: vec![],
+            },
 
             resources: vec![
                 arc_load("dude.png.xp"), //0
@@ -616,10 +618,6 @@ impl State {
 
             until_player_save: 10.0,
 
-            portal_locations: vec![
-                "main.map",
-                "portal_land.map"
-            ],
             destination_next_tick: RefCell::new(None),
             open_window: None,
         };
@@ -640,12 +638,15 @@ impl State {
             }
         };
 
-        state.ecs.spawn((
+        let player_pos = player.pos();
+        let player_entity_id = state.ecs.spawn((
         Container {
             items: vec![Item {
                 name: "Rusty Sword".to_string(),
                 art: state.resources[0].clone(),
-                effect_chain: Some(EffectChain::DamageTarget(None, 5)),
+                // Gotta reference count this bs because callbacks are dumb in rust fml otherwise
+                // deal with the wrath of the dyanmic size clone trait hate
+                effect_chain: Arc::new(Some(Box::new(SingleTargetEffects::DamageTarget(None, 5)))),
             }],
             max_items: 999,
         }, 
@@ -653,40 +654,38 @@ impl State {
             equips: vec![None, None, None],
             max_equips: 3,
         },
-        Player, player, PlayerAI, player_stat_block, EntityView {
+        Player,
+        player,
+        PlayerAI,
+        player_stat_block,
+        EntityView {
                 name: "Me...".to_string(),
                 art: state.resources[3].clone(),
-            }));
+            }
+        ));
 
+        //This clears entities so
         Self::load_entities_from_map(&mut state, &load_map.entities);
+        state.map_state.strict_add_from_pos(player_pos, player_entity_id);
 
         // state.generate_entities();
 
         state
     }
 
-
     fn set_tile(&mut self, x: i32, y: i32, t: TileType) {
-        let idx = self.xy_idx(x, y);
-        self.tiles[idx].set(t);
+        let idx = self.map_state.xy_idx(x, y);
+        self.map_state.tiles[idx].set(t);
     }
 
-    fn xy_idx(&self, x: i32, y: i32) -> usize {
-        (y as usize * self.map_width as usize) + x as usize
-    }
-
-    #[allow(dead_code)]
-    fn idx_xy(&self, idx: usize) -> (i32, i32) {
-        (idx as i32 % self.map_width, idx as i32 / self.map_width)
-    }
 
     fn in_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0 && x < self.map_width && y >= 0 && y < self.map_height
+        x >= 0 && x < self.map_width() && y >= 0 && y < self.map_height()
     }
 
     fn can_move(&self, x: i32, y: i32) -> bool {
         self.in_bounds(x, y)
-            && match self.tiles[self.xy_idx(x, y)].get() {
+            && match self.map_state.tiles[self.map_state.xy_idx(x, y)].get() {
                 TileType::Wall(_) => false,
                 _ => true,
             }
@@ -699,13 +698,13 @@ impl State {
 
         println!("{} {}", x, y);
 
-        let x_map = self.portal_locations[destination];
+        let x_map = self.map_state.portal_locations[destination];
         let load_map = map_utils::load_from_file(x_map);
 
-        self.map_width = load_map.width;
-        self.map_height = load_map.height;
+        self.map_state.map_width = load_map.width;
+        self.map_state.map_height = load_map.height;
 
-        self.tiles = map_utils::map_to_cells(load_map.tiles);
+        self.map_state.tiles = map_utils::map_to_cells(load_map.tiles);
 
         let entities_to_drop = self.ecs.query::<Option<&Player>>().iter().map(| (e, plo) | (e.clone(), plo.is_none())).collect::<Vec<_>>();
 
@@ -720,78 +719,67 @@ impl State {
 
         self.camera.borrow_mut().update_xy(x, y);
 
-        let mut _p = self.get_player_be();
+        let _pid = self.ecs.get_player_id();
+        let mut _p = self.ecs.get_player_be();
         _p.set_x(x);
         _p.set_y(y);
+        let pos = self.map_state.xy_idx(x, y);
+        self.map_state.entities[pos].insert(_pid);
         
     }
 
-    fn get_player_be(&mut self) -> RefMut<'_, BasicEntity> {
-        let pid = self.get_player_id();
-        self.ecs.get_mut::<BasicEntity>(
-                pid
-            ).unwrap()
-    }
-
-    fn get_player(&self) -> Ref<'_, BasicEntity> {
-        let pid = self.get_player_id();
-        self.ecs.get::<BasicEntity>(
-                pid
-            ).unwrap()
-    }
-
-    fn get_player_id(&self) -> EntityIndex {
-        self.ecs.query::<&Player>().iter().map(|( e, _ )| e).next().expect("Failed to get player entity.")
-    }
-
-    fn get_entity_comp(&self, me: EntityIndex) -> Ref<'_, BasicEntity> {
-        self.ecs.get::<BasicEntity>(me).expect("Failed to get entity.")
-    }
-
-    fn get_entity_comp_mut(&mut self, me: EntityIndex) -> RefMut<'_, BasicEntity> {
-        self.ecs.get_mut::<BasicEntity>(me).expect("Failed to get entity.")
-    }
 
     fn move_entity_by(&mut self, entity: EntityIndex, x: i32, y: i32) -> (i32, i32) {
-        let entity_r = self.get_entity_comp(entity);
+        let entity_r = self.ecs.get_entity_comp(entity);
         let new_x = entity_r.get_x() + x;
         let new_y = entity_r.get_y() + y;
         if self.can_move(new_x, new_y) {
             drop(entity_r);
-            let mut entity_r = self.get_entity_comp_mut(entity);
+            let mut entity_r = self.ecs.get_entity_comp_mut(entity);
+            let entity_r_pos = entity_r.pos();
+
+            //Remove from old position
+            // Return false for remove
+            assert!(!self.map_state.set_entity_from_pos(entity_r_pos, entity), "Desynced entity position");
             entity_r.set_x(new_x);
             entity_r.set_y(new_y);
+            // Add to new position
+            // first retrieve position again
+            let entity_r_pos = entity_r.pos();
+            //Should return true for add
+            assert!(self.map_state.set_entity_from_pos(entity_r_pos, entity), "Desynced entity position");
             return (x, y);
         }
         return (0, 0);
     }
 
     fn move_player_by(&mut self, x: i32, y: i32) {
-        let deltas = self.move_entity_by(self.get_player_id(), x, y);
+        let deltas = self.move_entity_by(self.ecs.get_player_id(), x, y);
         {
             let mut cm = self.camera.borrow_mut();
             cm.dx += deltas.0;
             cm.dy += deltas.1;
         }
         let (x, y) = {
-            let plyr = self.get_player_be();
+            let plyr = self.ecs.get_player_be();
             (plyr.get_x(), plyr.get_y())
         };
-        let idx_of = self.xy_idx(x, y);
-        if let TileType::Portal(_, destination, x, y) = self.tiles[idx_of].get() {
+        let idx_of = self.map_state.xy_idx(x, y);
+        if let TileType::Portal(_, destination, x, y) = self.map_state.tiles[idx_of].get() {
             *self.destination_next_tick.borrow_mut() = Some((destination, x, y));
         }
     }
 
     fn draw_map(&self, g_db: &mut DrawBatch) {
-        let l_x = math_utils::clamp(self.camera.borrow().mod_x(), 0, self.map_width);
-        let h_x = math_utils::clamp(self.camera.borrow().mod_x() + 40, 0, self.map_width);
-        let l_y = math_utils::clamp(self.camera.borrow().mod_y(), 0, self.map_height);
-        let h_y = math_utils::clamp(self.camera.borrow().mod_y() + 40, 0, self.map_height);
+        let l_x = math_utils::clamp(self.camera.borrow().mod_x(), 0, self.map_state.map_width);
+        let h_x = math_utils::clamp(self.camera.borrow().mod_x() + 40, 0, self.map_state.map_width);
+        let l_y = math_utils::clamp(self.camera.borrow().mod_y(), 0, self.map_state.map_height);
+        let h_y = math_utils::clamp(self.camera.borrow().mod_y() + 40, 0, self.map_state.map_height);
 
         for x in l_x..h_x {
             for y in l_y..h_y {
-                let tile = self.tiles[self.xy_idx(x, y)].get();
+                let tile_idx_local = self.map_state.xy_idx(x, y);
+                let tile = self.map_state.tiles[tile_idx_local].get();
                 let (x, y) = self.camera.borrow().transform_point((x, y));
 
                 match tile {
@@ -823,7 +811,7 @@ impl State {
 
         //Draw directional arrows around player
         {
-            let player = self.get_player();
+            let player = self.ecs.get_player();
             let (x, y) = (player.get_x(), player.get_y());
             let (x, y) = self.camera.borrow().transform_point((x, y));
 
@@ -852,7 +840,7 @@ impl State {
     }
 
     fn get_player_stat_block(&self) -> RefMut<StatBlock> {
-        self.ecs.get_mut::<StatBlock>(self.get_player_id()).expect("Failed to get player stat block.")
+        self.ecs.get_mut::<StatBlock>(self.ecs.get_player_id()).expect("Failed to get player stat block.")
     }
 
     fn save_player(&self) {
@@ -898,7 +886,7 @@ impl State {
 
         //Render Stat info
         {
-            let e_id = self.currently_viewed_stat_block.unwrap_or(self.get_player_id());
+            let e_id = self.currently_viewed_stat_block.unwrap_or(self.ecs.get_player_id());
             let stat_block_to_draw = if !self.currently_viewed_stat_block.is_none() {
                 let fetch_res = self.ecs.get_mut::<StatBlock>(e_id);
                 if fetch_res.is_ok() { fetch_res.unwrap() }
@@ -968,7 +956,7 @@ impl State {
                 } else {
                     if key == VirtualKeyCode::I {
                         self.open_window = Some(Box::new(InventoryUI {
-                            container_id: self.get_player_id(),
+                            container_id: self.ecs.get_player_id(),
                             pending_item: RefCell::new(None)
                         }));
                     }
@@ -986,16 +974,24 @@ impl State {
 
         rltk::render_draw_buffer(ctx).expect("Rendering error");
 
-        let player_art = self
+        let _player_art = self
             .ecs
             .query::<(&Player, &EntityView)>()
-            .iter().map(|(a, (b, c))| { c }).next().unwrap();
+            .iter().map(|(_, (_, c))| { c }).next().unwrap();
 
-        let c_view_art = self.ecs.get::<EntityView>(self.currently_viewed_art.unwrap_or(self.get_player_id()));
+        let c_view_art = self.ecs.get::<EntityView>(self.currently_viewed_art.unwrap_or(self.ecs.get_player_id()));
         if c_view_art.is_err() {
             self.currently_viewed_art = None;
         }
-        self.print_image_at(41, 20, &c_view_art.unwrap_or(self.get_player_view()), ctx);
+        self.print_image_at(41, 20, &c_view_art.unwrap_or(self.ecs.get_player_view()), ctx);
+    }
+
+    fn map_width(&self) -> i32 {
+        return self.map_state.map_width;
+    }
+
+    fn map_height(&self) -> i32 {
+        return self.map_state.map_height;
     }
 
 }

@@ -1,8 +1,10 @@
 use crate::{EntityIndex, State, math_utils};
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::{max, min};
+use std::collections::HashSet;
 use std::f32::consts::SQRT_2;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use hecs::World;
@@ -36,6 +38,111 @@ pub mod map_utils {
     pub fn map_to_cells(tiles: Vec<TileType>) -> Vec<Cell<TileType>> {
         tiles.into_iter().map(|tile| Cell::new(tile)).collect()
     }
+}
+
+pub struct EntityWorld {
+    pub ecs: World,
+}
+
+impl EntityWorld {
+
+    pub fn get_player_view(&self) -> hecs::Ref<EntityView> {
+        self.ecs.get::<EntityView>(self.get_player_id()).expect("Failed to get player view.")
+    }
+
+    pub fn get_player_be(&mut self) -> hecs::RefMut<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get_mut::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    pub fn get_player(&self) -> hecs::Ref<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    pub fn get_player_id(&self) -> EntityIndex {
+        self.ecs.query::<&Player>().iter().map(|( e, _ )| e).next().expect("Failed to get player entity.")
+    }
+
+    pub fn get_entity_comp(&self, me: EntityIndex) -> hecs::Ref<'_, BasicEntity> {
+        self.ecs.get::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+    pub fn get_entity_comp_mut(&mut self, me: EntityIndex) -> hecs::RefMut<'_, BasicEntity> {
+        self.ecs.get_mut::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+}
+
+impl Deref for EntityWorld {
+    type Target = World;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ecs
+    }
+}
+
+impl DerefMut for EntityWorld {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ecs
+    }
+}
+
+pub struct InternalMapState {
+    pub map_width: i32,
+    pub map_height: i32,
+
+    pub portal_locations: Vec<&'static str>,
+
+    pub tiles: Vec<Cell<TileType>>,
+    //Can have many entities per tile
+    pub entities: Vec<HashSet<EntityIndex>>,
+}
+
+impl InternalMapState {
+
+    pub fn clear_entities(&mut self) {
+        self.entities = vec![HashSet::new(); self.tiles.len()];
+    }
+
+    pub fn xy_idx(&self, x: i32, y: i32) -> usize {
+        (y as usize * self.map_width as usize) + x as usize
+    }
+
+    #[allow(dead_code)]
+    pub fn idx_xy(&self, idx: usize) -> (i32, i32) {
+        (idx as i32 % self.map_width, idx as i32 / self.map_width)
+    }
+
+    pub fn strict_remove_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) {
+        let idx = self.xy_idx(pos.0, pos.1);
+        self.entities[idx].remove(&entity);
+    }
+
+    pub fn strict_add_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) {
+        let idx = self.xy_idx(pos.0, pos.1);
+        self.entities[idx].insert(entity);
+    }
+
+    /*
+     * Removes entity if it exists on the specified position otherwise adds it
+     * returns true if entity was added, false if removed
+     */
+    pub fn set_entity_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) -> bool {
+        let idx = self.xy_idx(pos.0, pos.1);
+        if self.entities[idx].contains(&entity) {
+            self.entities[idx].remove(&entity);
+            return false;
+        } else {
+            self.entities[idx].insert(entity);
+            return true;
+        }
+    }
+
 }
 
 #[derive(Copy, Clone)]
@@ -120,19 +227,6 @@ impl Display {
         return RGB::named(self.bg);
     }
 }
-
-// pub trait Entity {
-//     fn get_x(&self) -> i32;
-//     fn get_y(&self) -> i32;
-//     fn get_display(&self) -> Display;
-//
-//     fn set_x(&mut self, x: i32);
-//     fn set_y(&mut self, y: i32);
-//
-//     fn set_display(&mut self, display: Display);
-//
-//     fn move_by(&mut self, _dx: i32, _dy: i32);
-// }
 
 pub struct SelfDestructAI {
     pub turns_left: i32,
@@ -227,7 +321,7 @@ impl ZombieAI {
 
     pub fn on_turn(state: &mut State, me: EntityIndex) {
         //let be = ecs.get::<BasicEntity>(e).unwrap();
-        let plr_pos = state.get_player();
+        let plr_pos = state.ecs.get_player();
         let be_comp = state.ecs.get_mut::<BasicEntity>(me).unwrap();
 
         let dx = plr_pos.get_x() - be_comp.get_x();
@@ -274,6 +368,10 @@ impl BasicEntity {
 
     pub fn get_y(&self) -> i32 {
         self.y
+    }
+
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
     }
 
     pub fn get_display(&self) -> Display {
@@ -401,7 +499,7 @@ pub trait EntityLootHandler {
 pub struct SpiderLoot { pub id: EntityIndex, pub max_atk: i32}
 
 impl EntityLootHandler for SpiderLoot {
-    fn handle_loot(&mut self, state: &crate::State) {
+    fn handle_loot(&mut self, _state: &crate::State) {
         // if math_utils::chance(0.3) {
         //     //Improve player's atk up to 5
         //     let mut player_stats = state
@@ -425,20 +523,31 @@ impl EntityLootHandler for SpiderLoot {
     }
 }
 
-#[derive(Clone)]
-pub enum EffectChain {
-    DamageTarget(Option<Box<EffectChain>>, i32),
-    HealTarget(Option<Box<EffectChain>>, i32),
-    HealUser(Option<Box<EffectChain>>, i32),
+pub type EffectLink = Option<Box<dyn EffectHandler + Send + Sync>>;
+
+pub trait EffectHandler {
+    fn handle_effect(&self, world: &mut EntityWorld, user: EntityIndex, targets: Vec<EntityIndex>);
 }
 
-impl EffectChain {
+pub enum SingleTargetEffects {
+    NoneEffect,
+    DamageTarget(EffectLink, i32),
+    HealTarget(EffectLink, i32),
+    HealUser(EffectLink, i32),
+}
 
-    pub fn handle_chain_target(&self, user: Option<EntityIndex>, target: Option<EntityIndex>, state: &mut State) {
+/*
+ * Single target effects apply to all "targets" already in list then simply proceed.
+ */
+impl EffectHandler for SingleTargetEffects {
+    fn handle_effect(&self, world: &mut EntityWorld, _user: EntityIndex, targets: Vec<EntityIndex>) {
         match self {
-            EffectChain::DamageTarget(chain, amt) => {
-                if let Some(target) = target {
-                    state.ecs.get_mut::<StatBlock>(target).unwrap().hp.decrement(*amt);
+            Self::DamageTarget(_chain, amt) => {
+                for target in &targets {
+                    world.get_mut::<StatBlock>(*target).unwrap().hp.decrement(*amt);
+                }
+                if let Some(chain) = _chain {
+                    chain.handle_effect(world, _user, targets);
                 }
             }
             _ => {}
@@ -450,7 +559,7 @@ impl EffectChain {
 pub struct Item {
     pub name: String,
     pub art: Arc<XpFile>,
-    pub effect_chain: Option<EffectChain>,
+    pub effect_chain: Arc<EffectLink>,
 }
 
 pub struct Container {
@@ -471,6 +580,7 @@ impl Container {
 }
 
 pub struct Equipment {
+    /* matches an index to the container's item */
     pub equips: Vec<Option<usize>>,
     pub max_equips: usize,
 }
@@ -516,7 +626,7 @@ impl InventoryUI {
 
     // Equips item from slot into item slot of equipment
     fn equip_item(&self, state: &mut State, slot: usize, item: usize) {
-        let mut player_equips = state.ecs.get_mut::<Equipment>(state.get_player_id()).unwrap();
+        let mut player_equips = state.ecs.get_mut::<Equipment>(state.ecs.get_player_id()).unwrap();
         if let Some(Some(in_slot)) = player_equips.equips.get(item) {
             if *in_slot == slot {
                 player_equips.equips[item] = None;
