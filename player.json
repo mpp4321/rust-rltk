@@ -1,1 +1,1 @@
-{"id":0,"def":{"name":"Defense","base":1,"bonus":0,"max":1},"atk":{"name":"Attack","base":5,"bonus":0,"max":5},"hp":{"name":"Hit Points","base":30,"bonus":0,"max":30},"dead":false}
+{"def":{"name":"Defense","base":1,"bonus":0,"max":1},"atk":{"name":"Attack","base":5,"bonus":0,"max":5},"hp":{"name":"Hit Points","base":30,"bonus":0,"max":30},"dead":true}

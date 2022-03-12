@@ -1,47 +1,27 @@
-use std::borrow::BorrowMut;
-
-use crate::{EntityIndex, math_utils};
 
 pub mod entity_create {
     use crate::*;
 
-    macro_rules! somebox {
-        ($($x:tt)*) => {
-            Some(Box::new($($x)*))
-        };
-    }
-
-    macro_rules! somerefcell {
-        ($($x:tt)*) => {
-            Some(RefCell::new($($x)*))
-        };
-    }
-
-    macro_rules! somerc {
-        ($($x:tt)*) => {
-            Some(Rc::new($($x)*))
-        };
-    }
-
-    pub fn resolve_entity_string(state: &mut State, pos: (i32, i32), str_e: &str) {
+    pub fn resolve_entity_string(state: &mut State, pos: (i32, i32), str_e: &str) -> EntityIndex {
         match str_e {
             "Goblin" => create_goblin(state, pos),
             "SFElemental" => create_fire_elemental(state, pos),
             "Spider" => create_spider(state, pos),
             "KSpider" => create_king_spider(state, pos),
+            "Crazy Eyes" => create_crazy_eyes(state, pos),
+            "Tall Dude" => create_tall_dude(state, pos),
+            "Rock" => create_rock(state, pos),
             _ => panic!("Entity not able to be resolved")
         }
     }
 
     fn basic_en(
-        id: usize,
         pos: (i32, i32),
         glyph: u16,
         fg: (u8, u8, u8),
         bg: (u8, u8, u8),
     ) -> BasicEntity {
         BasicEntity {
-            id,
             x: pos.0,
             y: pos.1,
             d: Display {
@@ -52,155 +32,154 @@ pub mod entity_create {
         }
     }
 
-    pub fn create_fire_elemental(state: &mut State, pos: (i32, i32)) {
-        let entity_id = state.consume_free_slot();
+    pub fn create_crazy_eyes(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, '%' as u16, rltk::PURPLE4, rltk::RED);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
 
-        let entity_component = basic_en(entity_id, pos, '*' as u16, rltk::BLACK, rltk::RED);
+        stat_component.hp.set(22);
+        stat_component.atk.set(10);
+        stat_component.def.set(5);
 
-        let ai_component = ZombieAI { id: entity_id };
+        let art = state.resources[8].clone();
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
+                EntityView {
+                    name: "Crazyyyy Eyes".to_string(),
+                    art: art
+                }
+        ))
+    }
 
-        let mut stat_component = StatBlock {
-            id: entity_id,
-            ..Default::default()
-        };
-        stat_component.hp.set(20);
-        stat_component.atk.set(3);
+    pub fn create_tall_dude(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, '|' as u16, rltk::PURPLE4, rltk::DARKGRAY);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
+
+        stat_component.hp.set(13);
+        stat_component.atk.set(20);
         stat_component.def.set(1);
 
-        let art = state.resources[1].clone();
-        add_entity(
-            state,
-            entity_component,
-            entity_id,
-            ai_component,
-            stat_component,
-            somerc!(
+        let art = state.resources[7].clone();
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
                 EntityView {
-                    name: String::from("S Fire Elemental"),
-                    art: art.clone()
+                    name: "Tall Dude!".to_string(),
+                    art: art
                 }
-            )
-        );
+        ))
+    }
+    
+    pub fn create_rock(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, '0' as u16, rltk::GRAY56, rltk::DARKGRAY);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
+
+        stat_component.hp.set(47);
+        stat_component.atk.set(1);
+        stat_component.def.set(1);
+
+        let art = state.resources[6].clone();
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
+                EntityView {
+                    name: "Dah Rock".to_string(),
+                    art: art
+                }
+        ))
     }
 
-    fn add_entity<E: 'static + Entity, A: 'static + EntityAI>(
-        state: &mut State,
-        entity_component: E,
-        entity_id: usize,
-        ai_component: A,
-        stat_component: StatBlock,
-        entity_view: Option<Rc<EntityView>>
-    ) {
-        state.add_entity(
-            entity_id,
-            somebox!(RefCell::new(entity_component)),
-            somebox!(ai_component),
-            somerefcell!(stat_component),
-            entity_view,
-        );
+    pub fn create_fire_elemental(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, '*' as u16, rltk::RED, rltk::BROWN2);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
+
+        stat_component.hp.set(15);
+        stat_component.atk.set(7);
+
+        let goblin_man_art = state.resources[1].clone();
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
+                EntityView {
+                    name: "S Fire Elemental".to_string(),
+                    art: goblin_man_art
+                }
+        ))
     }
 
-    pub fn create_king_spider(state: &mut State, pos: (i32, i32)) {
-        let entity_id = state.consume_free_slot();
-
-        let entity_component = basic_en(entity_id, pos, 'S' as u16, rltk::BURLYWOOD, rltk::BROWN2);
-        let ai_component = ZombieAI { id: entity_id };
-
-        let mut stat_component = StatBlock {
-            id: entity_id,
-            ..Default::default()
-        };
+    pub fn create_king_spider(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, 'S' as u16, rltk::BURLYWOOD, rltk::BROWN2);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
 
         stat_component.hp.set(24);
-        stat_component.def.set(3);
         stat_component.atk.set(7);
 
         let goblin_man_art = state.resources[5].clone();
-
-        add_entity(
-            state,
-            entity_component,
-            entity_id,
-            ai_component,
-            stat_component,
-            somerc!(
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
                 EntityView {
-                    name: String::from("King Spider"),
-                    art: goblin_man_art.clone()
+                    name: "King Spider".to_string(),
+                    art: goblin_man_art
                 }
-            )
-        );
-
-        state.entity_loots[entity_id] = somebox!(RefCell::new(
-            SpiderLoot {
-                id: entity_id,
-                max_atk: 10
-            }
-        ));
+        ))
     }
 
-    pub fn create_spider(state: &mut State, pos: (i32, i32)) {
-        let entity_id = state.consume_free_slot();
 
-        let entity_component = basic_en(entity_id, pos, 's' as u16, rltk::BURLYWOOD, rltk::BROWN1);
-        let ai_component = ZombieAI { id: entity_id };
-
-        let mut stat_component = StatBlock {
-            id: entity_id,
-            ..Default::default()
-        };
+    pub fn create_spider(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, 's' as u16, rltk::BURLYWOOD, rltk::BROWN2);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
 
         stat_component.hp.set(12);
-        stat_component.def.set(1);
-        stat_component.atk.set(1);
+        stat_component.atk.set(2);
 
-        let art = state.resources[4].clone();
-        add_entity(
-            state,
-            entity_component,
-            entity_id,
-            ai_component,
-            stat_component,
-            somerc!(
+        let goblin_man_art = state.resources[4].clone();
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
                 EntityView {
-                    name: String::from("Spider"),
-                    art: art.clone()
+                    name: "Spider".to_string(),
+                    art: goblin_man_art
                 }
-            )
-        );
-        state.entity_loots[entity_id] = somebox!(RefCell::new(
-            SpiderLoot {
-                id: entity_id,
-                max_atk: 5
-            }
-        ));
+        ))
     }
 
-    pub fn create_goblin(state: &mut State, pos: (i32, i32)) {
-        let entity_id = state.consume_free_slot();
+    pub fn create_goblin(state: &mut State, pos: (i32, i32)) -> EntityIndex {
+        let entity_component = basic_en(pos, 'g' as u16, rltk::RED, rltk::BLACK);
+        let ai_component = ZombieAI;
+        let mut stat_component = StatBlock::default();
 
-        let entity_component = basic_en(entity_id, pos, 'g' as u16, rltk::RED, rltk::BLACK);
-        let ai_component = ZombieAI { id: entity_id };
-        let mut stat_component = StatBlock {
-            id: entity_id,
-            ..Default::default()
-        };
         stat_component.hp.set(10);
         stat_component.atk.set(1);
 
         let goblin_man_art = state.resources[0].clone();
-        add_entity(
-            state,
-            entity_component,
-            entity_id,
-            ai_component,
-            stat_component,
-            somerc!(
+        
+        state.ecs.spawn((
+                entity_component,
+                ai_component,
+                stat_component,
                 EntityView {
-                    name: String::from("Goblin Dude"),
-                    art: goblin_man_art.clone()
+                    name: "Goblina".to_string(),
+                    art: goblin_man_art
                 }
-            )
-        );
+        ))
     }
 }

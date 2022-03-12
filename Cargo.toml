@@ -10,3 +10,4 @@ rltk = "*"
 rand = "*"
 serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "*"
+hecs = "*"

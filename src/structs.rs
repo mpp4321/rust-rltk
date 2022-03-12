@@ -1,10 +1,14 @@
 use crate::{EntityIndex, State, math_utils};
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::{max, min};
-use std::rc::Rc;
+use std::collections::HashSet;
+use std::f32::consts::SQRT_2;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use rltk::{RGB, TextBuilder, XpFile};
+use hecs::World;
+use rltk::{DrawBatch, Point, RGB, Rltk, TextBuilder, VirtualKeyCode, XpFile};
 use serde::{Deserialize, Serialize};
 
 pub mod map_utils {
@@ -35,6 +39,119 @@ pub mod map_utils {
         tiles.into_iter().map(|tile| Cell::new(tile)).collect()
     }
 }
+
+pub struct EntityWorld {
+    pub ecs: World,
+}
+
+impl EntityWorld {
+
+    pub fn get_player_view(&self) -> hecs::Ref<EntityView> {
+        self.ecs.get::<EntityView>(self.get_player_id()).expect("Failed to get player view.")
+    }
+
+    pub fn get_player_be(&mut self) -> hecs::RefMut<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get_mut::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    pub fn get_player(&self) -> hecs::Ref<'_, BasicEntity> {
+        let pid = self.get_player_id();
+        self.ecs.get::<BasicEntity>(
+                pid
+            ).unwrap()
+    }
+
+    pub fn get_player_id(&self) -> EntityIndex {
+        self.ecs.query::<&Player>().iter().map(|( e, _ )| e).next().expect("Failed to get player entity.")
+    }
+
+    pub fn get_entity_comp(&self, me: EntityIndex) -> hecs::Ref<'_, BasicEntity> {
+        self.ecs.get::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+    pub fn get_entity_comp_mut(&mut self, me: EntityIndex) -> hecs::RefMut<'_, BasicEntity> {
+        self.ecs.get_mut::<BasicEntity>(me).expect("Failed to get entity.")
+    }
+
+}
+
+impl Deref for EntityWorld {
+    type Target = World;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ecs
+    }
+}
+
+impl DerefMut for EntityWorld {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ecs
+    }
+}
+
+pub struct InternalMapState {
+    pub map_width: i32,
+    pub map_height: i32,
+
+    pub portal_locations: Vec<&'static str>,
+
+    pub tiles: Vec<Cell<TileType>>,
+    //Can have many entities per tile
+    pub entities: Vec<HashSet<EntityIndex>>,
+}
+
+impl InternalMapState {
+
+    pub fn clear_entities(&mut self) {
+        self.entities = vec![HashSet::new(); self.tiles.len()];
+    }
+
+    pub fn xy_idx(&self, x: i32, y: i32) -> usize {
+        (y as usize * self.map_width as usize) + x as usize
+    }
+
+    #[allow(dead_code)]
+    pub fn idx_xy(&self, idx: usize) -> (i32, i32) {
+        (idx as i32 % self.map_width, idx as i32 / self.map_width)
+    }
+
+    pub fn strict_remove_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) {
+        let idx = self.xy_idx(pos.0, pos.1);
+        self.entities[idx].remove(&entity);
+    }
+
+    pub fn strict_add_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) {
+        let idx = self.xy_idx(pos.0, pos.1);
+        self.entities[idx].insert(entity);
+    }
+
+    /*
+     * Removes entity if it exists on the specified position otherwise adds it
+     * returns true if entity was added, false if removed
+     */
+    pub fn set_entity_from_pos(&mut self, pos: (i32, i32), entity: EntityIndex) -> bool {
+        let idx = self.xy_idx(pos.0, pos.1);
+        if self.entities[idx].contains(&entity) {
+            self.entities[idx].remove(&entity);
+            return false;
+        } else {
+            self.entities[idx].insert(entity);
+            return true;
+        }
+    }
+
+}
+
+#[derive(Copy, Clone)]
+pub enum DirectionalInputTypes {
+    Attack
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Player;
 
 #[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct EntityStat {
@@ -111,55 +228,26 @@ impl Display {
     }
 }
 
-pub trait EntityAI {
-    fn get_id(&self) -> EntityIndex;
-
-    fn on_turn(&mut self, state: &State);
-    fn on_remove(&mut self, state: &State);
-    fn on_death(&mut self, state: &State);
-}
-
-//Just things that every entity has and needs for rendering
-pub trait Entity {
-    fn get_id(&self) -> EntityIndex;
-
-    fn get_x(&self) -> i32;
-    fn get_y(&self) -> i32;
-    fn get_display(&self) -> Display;
-
-    fn set_x(&mut self, x: i32);
-    fn set_y(&mut self, y: i32);
-
-    fn set_display(&mut self, display: Display);
-
-    fn move_by(&mut self, _dx: i32, _dy: i32);
-}
-
 pub struct SelfDestructAI {
-    id: EntityIndex,
-    turns_left: i32,
+    pub turns_left: i32,
 }
 
-impl EntityAI for SelfDestructAI {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+impl SelfDestructAI {
 
-    fn on_turn(&mut self, state: &State) {
-        self.turns_left -= 1;
-        if self.turns_left < 0 {
-            state.queue_destruction(self.get_id());
+    pub fn on_turn(state: &mut State, me: EntityIndex) {
+        let mut sd_ai = state.ecs.get_mut::<SelfDestructAI>(me).unwrap();
+
+        sd_ai.turns_left -= 1;
+        
+        if sd_ai.turns_left < 0 {
+            drop(sd_ai);
+            state.ecs.despawn(me).expect("Failed to despawn an entity");
         }
     }
 
-    fn on_remove(&mut self, _state: &State) {}
-
-    fn on_death(&mut self, _state: &State) {}
 }
 
 pub struct BasicEntity {
-    pub id: EntityIndex,
-
     pub x: i32,
     pub y: i32,
     pub d: Display,
@@ -168,8 +256,6 @@ pub struct BasicEntity {
 //Entities with stat blocks and complex interactions etc
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatBlock {
-    pub id: EntityIndex,
-
     pub def: EntityStat,
     pub atk: EntityStat,
     pub hp: EntityStat,
@@ -180,7 +266,6 @@ pub struct StatBlock {
 impl Default for StatBlock {
     fn default() -> Self {
         StatBlock {
-            id: 0,
             atk: EntityStat::new("Attack", 0),
             def: EntityStat::new("Defense", 0),
             hp: EntityStat::new("Hit Points", 0),
@@ -190,9 +275,6 @@ impl Default for StatBlock {
 }
 
 impl StatBlock {
-    pub fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
 
     pub fn make_text_builder(&self, builder: &mut TextBuilder) {
         builder
@@ -203,51 +285,16 @@ impl StatBlock {
             .append(format!("DEF: {}", self.def.get_total()).as_str());
     }
 
-    pub fn take_damage(&mut self, state: &State, damage: i32) -> bool {
+    pub fn take_damage(&mut self, damage: i32) -> bool {
         self.hp.decrement(max(0, damage - self.def.get_total()) );
 
         if self.hp.get_total() <= 0 && !self.dead {
             self.dead = true;
-            state.ais.borrow_mut()[self.id] = Some(Box::new(SelfDestructAI { id: self.get_id(), turns_left: 5 }));
-            state.get_entity(self.id).borrow_mut().set_display(Display {
-                glyph: rltk::to_cp437('%'),
-                fg: rltk::RED,
-                bg: rltk::BLACK
-            });
-
-            if state.entity_loots[self.id].is_some() {
-                let mut e_loot = state.entity_loots[self.id].as_ref().unwrap().borrow_mut();
-                e_loot.handle_loot(state);
-            }
-
             return true;
         }
 
         return false;
     }
-}
-
-pub struct ZombieAI {
-    pub id: EntityIndex,
-}
-
-pub struct PlayerAI;
-
-impl EntityAI for PlayerAI {
-    fn get_id(&self) -> EntityIndex {
-        return 0;
-    }
-
-    fn on_turn(&mut self, state: &State) {
-        if math_utils::chance(0.3) {
-            // Get the player's stat block
-            let mut player_stats = state.stat_blocks[0].unwrap_ref_mut();
-            player_stats.hp.increment(1);
-        }
-    }
-
-    fn on_remove(&mut self, _: &State) {}
-    fn on_death(&mut self, _: &State) {}
 }
 
 pub trait MyOptionTimeSaver<T> {
@@ -267,82 +314,87 @@ impl<T> MyOptionTimeSaver<T> for Option<RefCell<T>> {
 
 }
 
-impl EntityAI for ZombieAI {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+#[derive(Clone, Copy)]
+pub struct ZombieAI;
 
-    fn on_turn(&mut self, state: &State) {
-        let me = self.get_id();
-        if math_utils::chance(0.5) {
-            return;
-        }
+impl ZombieAI {
 
-        let player_pos = (
-            state.get_entity(0).borrow().get_x(),
-            state.get_entity(0).borrow().get_y(),
-        );
-        let mut me = state.get_entity(me).borrow_mut();
-        let zombie_pos = (me.get_x(), me.get_y());
-        //Calculate the direction to the player from zombie_pos
-        let dx = player_pos.0 - zombie_pos.0;
-        let dy = player_pos.1 - zombie_pos.1;
-        //Calculate the distance as float
-        let distance = (((dx * dx) + (dy * dy)) as f32).sqrt();
-        if distance > 3.0 {
-            return;
-        }
-        //Normalize dx, dy
+    pub fn on_turn(state: &mut State, me: EntityIndex) {
+        //let be = ecs.get::<BasicEntity>(e).unwrap();
+        let plr_pos = state.ecs.get_player();
+        let be_comp = state.ecs.get_mut::<BasicEntity>(me).unwrap();
+
+        let dx = plr_pos.get_x() - be_comp.get_x();
+        let dy = plr_pos.get_y() - be_comp.get_y();
+
+        let dist = ((dx * dx + dy * dy) as f32).sqrt();
 
         let dx = dx / max(1, dx.abs());
         let dy = dy / max(1, dy.abs());
 
-        const SQRT_2DIST: f32 = 0.01 + std::f64::consts::SQRT_2 as f32;
-        if distance < SQRT_2DIST {
-            state.stat_blocks[0]
-                .unwrap_ref_mut()
-                .take_damage(state, state.stat_blocks[me.get_id()].unwrap_ref().atk.get_total());
-        } else if state.can_move(me.get_x() + dx, me.get_y() + dy) {
-            me.move_by(dx, dy);
+        let me_stats = state.ecs.get_mut::<StatBlock>(me).unwrap();
+
+        if me_stats.dead { return; }
+
+        if dist - 0.01_f32 < SQRT_2 {
+            // Attack here
+            let mut plr_stats = state.get_player_stat_block();
+            plr_stats.take_damage(me_stats.atk.get_total());
+        } else if dist < 5.0 && math_utils::chance(0.9) {
+            // Move here
+            drop(be_comp);
+            drop(plr_pos);
+            drop(me_stats);
+            state.move_entity_by(me, dx, dy);
         }
     }
-    fn on_remove(&mut self, _: &State) {}
-    fn on_death(&mut self, _: &State) {}
+
 }
 
-impl Entity for BasicEntity {
-    fn get_id(&self) -> EntityIndex {
-        return self.id;
-    }
+pub struct PlayerAI;
 
-    fn get_x(&self) -> i32 {
+impl PlayerAI {
+    pub fn on_turn(state: &mut State, e: EntityIndex) {
+        let st_bl = &mut *state.ecs.get_mut::<StatBlock>(e).unwrap();
+        st_bl.hp.increment(1);
+    }
+}
+
+impl BasicEntity {
+
+    pub fn get_x(&self) -> i32 {
         self.x
     }
 
-    fn get_y(&self) -> i32 {
+    pub fn get_y(&self) -> i32 {
         self.y
     }
 
-    fn get_display(&self) -> Display {
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    pub fn get_display(&self) -> Display {
         self.d
     }
 
-    fn set_x(&mut self, x: i32) {
+    pub fn set_x(&mut self, x: i32) {
         self.x = x;
     }
 
-    fn set_y(&mut self, y: i32) {
+    pub fn set_y(&mut self, y: i32) {
         self.y = y;
     }
 
-    fn set_display(&mut self, display: Display) {
+    pub fn set_display(&mut self, display: Display) {
         self.d = display;
     }
 
-    fn move_by(&mut self, dx: i32, dy: i32) {
+    pub fn move_by(&mut self, dx: i32, dy: i32) {
         self.x += dx;
         self.y += dy;
     }
+
 }
 
 pub struct Camera {
@@ -431,7 +483,7 @@ impl Camera {
 
 pub struct EntityView {
     pub name: String,
-    pub art: Rc<XpFile>,
+    pub art: Arc<XpFile>,
 }
 
 impl EntityView {
@@ -439,38 +491,289 @@ impl EntityView {
         builder.centered(self.name.as_str()).ln();
     }
 }
+
 pub trait EntityLootHandler {
-    fn get_id(&self) -> EntityIndex;
     fn handle_loot(&mut self, state: &crate::State);
 }
 
 pub struct SpiderLoot { pub id: EntityIndex, pub max_atk: i32}
 
 impl EntityLootHandler for SpiderLoot {
-    fn get_id(&self) -> EntityIndex {
-        self.id
+    fn handle_loot(&mut self, _state: &crate::State) {
+        // if math_utils::chance(0.3) {
+        //     //Improve player's atk up to 5
+        //     let mut player_stats = state
+        //         .stat_blocks[0]
+        //         .unwrap_ref_mut();
+        //
+        //     let hp_cur_max = player_stats.hp.get_max();
+        //     if hp_cur_max < 30 {
+        //         player_stats.hp.set_max(
+        //             hp_cur_max + 1
+        //         );
+        //     }
+        //
+        //     let atk_cur_max = player_stats.atk.get_max();
+        //     if atk_cur_max < self.max_atk {
+        //         player_stats.atk.set(
+        //             atk_cur_max + 1
+        //         );
+        //     }
+        // }
+    }
+}
+
+pub type EffectLink = Option<Box<dyn EffectHandler + Send + Sync>>;
+
+pub trait EffectHandler {
+    fn handle_effect(&self, world: &mut EntityWorld, user: EntityIndex, targets: Vec<EntityIndex>);
+}
+
+pub enum SingleTargetEffects {
+    NoneEffect,
+    DamageTarget(EffectLink, i32),
+    HealTarget(EffectLink, i32),
+    HealUser(EffectLink, i32),
+}
+
+/*
+ * Single target effects apply to all "targets" already in list then simply proceed.
+ */
+impl EffectHandler for SingleTargetEffects {
+    fn handle_effect(&self, world: &mut EntityWorld, _user: EntityIndex, targets: Vec<EntityIndex>) {
+        match self {
+            Self::DamageTarget(_chain, amt) => {
+                for target in &targets {
+                    world.get_mut::<StatBlock>(*target).unwrap().hp.decrement(*amt);
+                }
+                if let Some(chain) = _chain {
+                    chain.handle_effect(world, _user, targets);
+                }
+            }
+            _ => {}
+        }
     }
 
-    fn handle_loot(&mut self, state: &crate::State) {
-        if math_utils::chance(0.3) {
-            //Improve player's atk up to 5
-            let mut player_stats = state
-                .stat_blocks[0]
-                .unwrap_ref_mut();
+}
 
-            let hp_cur_max = player_stats.hp.get_max();
-            if hp_cur_max < 30 {
-                player_stats.hp.set_max(
-                    hp_cur_max + 1
-                );
-            }
+pub struct Item {
+    pub name: String,
+    pub art: Arc<XpFile>,
+    pub effect_chain: Arc<EffectLink>,
+}
 
-            let atk_cur_max = player_stats.atk.get_max();
-            if atk_cur_max < self.max_atk {
-                player_stats.atk.set(
-                    atk_cur_max + 1
-                );
-            }
+pub struct Container {
+    pub items: Vec<Item>,
+    pub max_items: usize,
+}
+
+impl Container {
+    pub fn try_add_item(&mut self, item: Item) -> Option<Item> {
+        let max_items = self.max_items;
+        let items = &mut self.items;
+        if items.len() >= max_items {
+            return Some(item);
+        }
+        items.push(item);
+        None
+    }
+}
+
+pub struct Equipment {
+    /* matches an index to the container's item */
+    pub equips: Vec<Option<usize>>,
+    pub max_equips: usize,
+}
+
+impl Equipment {
+    pub fn new() -> Self {
+        Equipment {
+            equips:vec![None; 3],
+            max_equips: 3
         }
     }
 }
+
+pub trait UInterface {
+    fn on_input(&self, state: &mut State, key: Option<VirtualKeyCode>) -> bool;
+    fn render(&self, ctx: &mut Rltk, state: &State);
+}
+
+pub struct InventoryUI {
+    pub container_id: EntityIndex,
+    pub pending_item: RefCell<Option<usize>>,
+}
+
+impl InventoryUI {
+    // The general function for handling input for the inventory UI
+    fn select_item(&self, state: &mut State, item: usize) {
+        if self.pending_item.borrow().is_some() {
+            let slot = self.pending_item.borrow().unwrap();
+            self.equip_item(state, slot, item);
+            // gotta see if it changed because of equip_item
+            let slot = self.pending_item.borrow();
+            if slot.is_none() { return; }
+            if slot.unwrap() == item {
+                //Gotta drop slot here cus it's borrowing pending_items already
+                drop(slot);
+                self.pending_item.replace(None);
+                return;
+            }
+            return;
+        }
+        self.pending_item.borrow_mut().replace(item);
+    }
+
+    // Equips item from slot into item slot of equipment
+    fn equip_item(&self, state: &mut State, slot: usize, item: usize) {
+        let mut player_equips = state.ecs.get_mut::<Equipment>(state.ecs.get_player_id()).unwrap();
+        if let Some(Some(in_slot)) = player_equips.equips.get(item) {
+            if *in_slot == slot {
+                player_equips.equips[item] = None;
+                return;
+            }
+        }
+        player_equips.equips[item] = Some(slot);
+        self.pending_item.replace(None);
+    }
+}
+
+pub const fn enumerate_key_displays() -> [char; 32] {
+    return [
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+        '8',
+        '9',
+        '0',
+        'a',
+        'b',
+        'c',
+        'd',
+        'e',
+        'f',
+        'g',
+        'h',
+        'i',
+        'j',
+        'k',
+        'l',
+        'm',
+        'n',
+        'o',
+        'p',
+        'q',
+        'r',
+        's',
+        't',
+        'u',
+        'v',
+    ];
+}
+
+pub const fn enumerate_keys() -> [VirtualKeyCode; 32] {
+    return [
+        VirtualKeyCode::Key1,
+        VirtualKeyCode::Key2,
+        VirtualKeyCode::Key3,
+        VirtualKeyCode::Key4,
+        VirtualKeyCode::Key5,
+        VirtualKeyCode::Key6,
+        VirtualKeyCode::Key7,
+        VirtualKeyCode::Key8,
+        VirtualKeyCode::Key9,
+        VirtualKeyCode::Key0,
+        VirtualKeyCode::A,
+        VirtualKeyCode::B,
+        VirtualKeyCode::C,
+        VirtualKeyCode::D,
+        VirtualKeyCode::E,
+        VirtualKeyCode::F,
+        VirtualKeyCode::G,
+        VirtualKeyCode::H,
+        VirtualKeyCode::I,
+        VirtualKeyCode::J,
+        VirtualKeyCode::K,
+        VirtualKeyCode::L,
+        VirtualKeyCode::M,
+        VirtualKeyCode::N,
+        VirtualKeyCode::O,
+        VirtualKeyCode::P,
+        VirtualKeyCode::Q,
+        VirtualKeyCode::R,
+        VirtualKeyCode::S,
+        VirtualKeyCode::T,
+        VirtualKeyCode::U,
+        VirtualKeyCode::V,
+    ];
+}
+
+pub fn get_index_from_key(key: VirtualKeyCode) -> Option<usize> {
+    const KEY_OPTIONS: [VirtualKeyCode; 32] = enumerate_keys();
+
+    if KEY_OPTIONS.contains(&key) {
+        for (i, k) in KEY_OPTIONS.iter().enumerate() {
+            if key == *k {
+                return Some(i);
+            }
+        }
+    }
+    return None;
+}
+
+impl UInterface for InventoryUI {
+    fn on_input(&self, state: &mut State, key: Option<VirtualKeyCode>) -> bool {
+        if key.is_none() { return false; }
+        const KEY_OPTIONS: [VirtualKeyCode; 32] = enumerate_keys();
+        let key = key.unwrap();
+
+        if KEY_OPTIONS.contains(&key) {
+            for (i, k) in KEY_OPTIONS.iter().enumerate() {
+                if key == *k {
+                    self.select_item(state, i);
+                }
+            }
+        }
+
+        if key == VirtualKeyCode::Escape {
+            return true;
+        }
+        return false;
+    }
+    
+    fn render(&self, ctx: &mut Rltk, state: &State) {
+        let mut g_db = DrawBatch::new();
+        g_db.cls();
+        
+        const KEY_OPTIONS: [char; 32] = enumerate_key_displays();
+
+        if let Ok(container) = state.ecs.get::<Container>(self.container_id) {
+            for (i, item) in container.items.iter().enumerate() {
+                if i >= KEY_OPTIONS.len() { break; }
+                g_db.print(Point::new(0, i), format!("{}: {}", KEY_OPTIONS[i], item.name).as_str());
+            }
+
+            if let Some(pi) = *self.pending_item.borrow() {
+                if let Ok(equipment) = state.ecs.get::<Equipment>(self.container_id) {
+                    for (i, item) in equipment.equips.iter().enumerate() {
+                        if i >= KEY_OPTIONS.len() { break; }
+                        let item_name = if item.is_some() { container.items[item.unwrap()].name.as_str() } else { "Empty" };
+                        g_db.print(Point::new(16, i), format!("{}: {}", KEY_OPTIONS[i], item_name).as_str());
+                    }
+                }
+            }
+        }
+
+        g_db.submit(0).expect("Rendering error with draw batch");
+
+        rltk::render_draw_buffer(ctx).expect("Rendering error");
+    }
+
+}
+
+
+
